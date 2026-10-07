@@ -8,3 +8,5 @@ core
 *.swp
 *~
 simple-social-cli
+simple-social-cli-interactive
+simple-social-tui

@@ -8,9 +8,7 @@ this one is a screen you drive with the keyboard. All three read and write the
 same `~/.simple-social-cli/` session state, so logging in with any of them logs
 you in everywhere, even though each repo now builds its own copy of the library.
 
-`simple-social-cli` is vendored in as a git submodule under `vendor/`, not a
-sibling checkout - this repo is self-contained. It never modifies the vendored
-copy.
+This tool lives in the `ssterminal` repo, next to the shared library in `../lib/`. The top-level `Makefile` builds everything; see the root README.
 
 ## Build
 
@@ -30,17 +28,15 @@ Then clone and build somewhere you can write to, such as your home directory:
 
 ```
 cd ~
-git clone --recursive https://github.com/DavidFruin/simple-social-tui.git
-cd simple-social-tui && make
+git clone https://github.com/DavidFruin/ssterminal.git
+cd ssterminal && make tui
 ```
 
 Don't clone from `/` or another root-owned directory. `git clone` fails there
 with `could not create work tree dir ... Permission denied`. Using `sudo git
 clone` instead leaves a root-owned tree that `make` can't write to either.
 
-`make` builds the vendored `simple-social-cli` library automatically if it isn't
-already built. If you cloned without `--recursive`, run
-`git submodule update --init --recursive` first.
+`make` builds the shared library automatically if it isn't already built.
 
 Running it needs a UTF-8 locale.
 
@@ -51,7 +47,7 @@ repository under `/etc/apt/sources.list.d/`.
 
 The built binary is statically linked against the vendored library (no `.so` to
 keep track of), so it works wherever it ends up - copied, symlinked, whatever.
-`sudo make install` puts it on your PATH as `sstui`; `sudo make uninstall`
+`sudo make install-tui` puts it on your PATH as `sstui`; `sudo make uninstall` (removes all three)
 removes it.
 
 ## Run

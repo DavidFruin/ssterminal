@@ -22,7 +22,7 @@ import sys
 import tempfile
 import time
 
-REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+REPO_ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 BIN = os.path.join(REPO_ROOT, "simple-social-cli-interactive")
 BASE_URL = os.environ.get("TEST_BASE_URL", "https://dev.davidfruin.com")
 EMAIL = os.environ.get("TEST_EMAIL")

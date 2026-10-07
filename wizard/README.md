@@ -5,8 +5,7 @@ library as `simple-social-cli` and `simple-social-tui`. Each tool keeps its own
 session under `~/.simple-social-cli/<tool>/` - logging in with one does not log
 you in on the others.
 
-`simple-social-cli` is vendored in as a git submodule under `vendor/`, not a sibling
-checkout - this repo is self-contained. It never modifies the vendored copy.
+This tool lives in the `ssterminal` repo, next to the shared library in `../lib/`. The top-level `Makefile` builds everything; see the root README.
 
 ## Build
 
@@ -24,20 +23,18 @@ Then clone and build somewhere you can write to, such as your home directory:
 
 ```
 cd ~
-git clone --recursive https://github.com/DavidFruin/simple-social-cli-interactive.git
-cd simple-social-cli-interactive && make
+git clone https://github.com/DavidFruin/ssterminal.git
+cd ssterminal && make wizard
 ```
 
 Don't clone from `/` or another root-owned directory. `git clone` fails there
 with `could not create work tree dir ... Permission denied`.
 
-`make` builds the vendored `simple-social-cli` library automatically if it isn't
-already built. If you cloned without `--recursive`, run
-`git submodule update --init --recursive` first.
+`make` builds the shared library automatically if it isn't already built.
 
 The built binary is statically linked against the vendored library (no `.so` to
 keep track of), so it works wherever it ends up - copied, symlinked, whatever.
-`sudo make install` puts it on your PATH as `sswiz`; `sudo make uninstall`
+`sudo make install-wizard` puts it on your PATH as `sswiz`; `sudo make uninstall` (removes all three)
 removes it.
 
 ## Run
