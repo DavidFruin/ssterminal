@@ -141,7 +141,7 @@ static int cmd_send_otp(int argc, char **argv) {
     config_t cfg;
     config_load(&cfg);
     api_init();
-    if (api_register_send_otp(argv[0]) != 0) {
+    if (api_register_send_otp(argv[0], NULL) != 0) {
         print_error(api_get_last_error());
         return 1;
     }

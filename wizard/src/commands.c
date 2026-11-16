@@ -79,7 +79,7 @@ static void cmd_register(ss_state_t *state, const wizard_answer_t *answers) {
 static void cmd_send_otp(ss_state_t *state, const wizard_answer_t *answers) {
     (void)state;
     const char *email = answers[0].text;
-    if (api_register_send_otp(email) != 0) {
+    if (api_register_send_otp(email, NULL) != 0) {
         print_error(api_get_last_error());
         return;
     }

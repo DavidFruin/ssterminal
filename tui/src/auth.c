@@ -146,7 +146,7 @@ static int do_register(app_t *app) {
     if (!ui_prompt(app, "Register", "Email:", 0, email, sizeof(email))) return 0;
 
     busy(app, "Sending code...");
-    if (api_register_send_otp(email) != 0) {
+    if (api_register_send_otp(email, NULL) != 0) {
         app_set_error(app, "%s", api_get_last_error());
         return 0;
     }
