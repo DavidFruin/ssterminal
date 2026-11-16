@@ -1,15 +1,18 @@
 #!/usr/bin/env bash
 # tests/test_cli.sh - Exercises the built CLI binary end to end, in both
-# human and --json output modes, against a real (test) account and server.
+# human and --json output modes.
 #
-# Deliberately no default credentials, same reason as the web Playwright
-# suite: a hardcoded fallback account that silently stops existing makes
-# every test "pass" by failing to log in. Set these before running:
+# Normally runs against a throwaway LOCAL server (tests/bench.sh), never dev
+# or prod. It needs an ssapi checkout:
 #
-#   TEST_EMAIL=you@example.com TEST_PASSWORD='...' ./tests/test_cli.sh
+#   SSAPI=~/dev/ssapi ./tests/test_cli.sh
 #
-# TEST_BASE_URL defaults to dev, not prod - this creates and deletes real
-# posts/comments, and dev is where that belongs.
+# The bench seeds owner@, alice@, bob@ and carol@test.local (password
+# Passw0rd!) and captures email in a file, so registration with an invite
+# code, password reset and every new command can be tested.
+#
+# Against another server instead (only the basic cases run there):
+#   TEST_BASE_URL=http://host TEST_EMAIL=... TEST_PASSWORD='...' ./tests/test_cli.sh
 #
 # Runs the binary with HOME pointed at a scratch directory for the whole
 # run, so it never touches your real ~/.simple-social-cli or
@@ -19,12 +22,23 @@
 set -u
 cd "$(dirname "$0")/.."
 
-BASE_URL="${TEST_BASE_URL:-https://dev.davidfruin.com}"
 BIN="./simple-social-cli"
-
-if [ -z "${TEST_EMAIL:-}" ] || [ -z "${TEST_PASSWORD:-}" ]; then
-  echo "Set TEST_EMAIL and TEST_PASSWORD (a real account on $BASE_URL) before running." >&2
-  exit 1
+BENCH=""
+if [ -z "${TEST_BASE_URL:-}" ]; then
+  if [ -z "${SSAPI:-}" ]; then
+    echo "Set SSAPI to an ssapi checkout (to start a local server), or TEST_BASE_URL + TEST_EMAIL + TEST_PASSWORD." >&2
+    exit 1
+  fi
+  BENCH="$(mktemp -d)"
+  BASE_URL="$(PORT=${PORT:-8191} tests/bench.sh start "$BENCH")" || { echo "bench failed to start" >&2; exit 1; }
+  TEST_EMAIL=alice@test.local
+  TEST_PASSWORD='Passw0rd!'
+else
+  BASE_URL="$TEST_BASE_URL"
+  if [ -z "${TEST_EMAIL:-}" ] || [ -z "${TEST_PASSWORD:-}" ]; then
+    echo "Set TEST_EMAIL and TEST_PASSWORD (a real account on $BASE_URL) before running." >&2
+    exit 1
+  fi
 fi
 
 if [ ! -x "$BIN" ]; then
@@ -43,6 +57,7 @@ cleanup() {
     [ -n "$pid" ] && "$BIN" --json delete "$pid" > /dev/null 2>&1
   done
   rm -rf "$SCRATCH_HOME"
+  if [ -n "$BENCH" ]; then tests/bench.sh stop "$BENCH"; rm -rf "$BENCH"; fi
 }
 trap cleanup EXIT
 
@@ -94,7 +109,8 @@ run "whoami (human)" 0 "$BIN" whoami > /dev/null
 
 echo "== reads, --json validity =="
 for cmd in "feed --limit 3" "posts --limit 3" "users" "profile" \
-           "followers" "following" "notifications --limit 3" "notify-count"; do
+           "followers" "following" "notifications --limit 3" "notify-count" \
+           "blocked" "invite" "devices"; do
   out=$(run "$cmd --json" 0 "$BIN" --json $cmd)
   assert_valid_json "$cmd --json" "$out"
 done
@@ -138,6 +154,10 @@ else
     out=$(run "comments --json" 0 "$BIN" --json comments "$POST_ID")
     assert_valid_json "comments shape" "$out"
     [ "$(json_field "$out" 'd["totalCount"]')" = "1" ] && ok || fail "comments totalCount: $out"
+    out=$(run "reply" 0 "$BIN" --json reply "$POST_ID" "$COMMENT_ID" "cli-test reply")
+    [ "$(json_field "$out" 'd["parentId"]')" = "$COMMENT_ID" ] && ok || fail "reply: $out"
+    out=$(run "comments threaded --json" 0 "$BIN" --json comments "$POST_ID")
+    [ "$(json_field "$out" '[c["parent_id"] for c in d["comments"]]')" = "[None, $COMMENT_ID]" ] && ok || fail "threaded: $out"
     run "delete-comment" 0 "$BIN" --json delete-comment "$COMMENT_ID" > /dev/null
   fi
 
@@ -146,6 +166,64 @@ else
 
   out=$(run "post <id> after delete (must 404)" 1 "$BIN" --json post "$POST_ID")
   [ "$(json_field "$out" 'd["ok"]')" = "False" ] && ok || fail "post-after-delete shape: $out"
+fi
+
+
+if [ -n "$BENCH" ]; then
+  MAIL="$BENCH/mail.log"
+  code_from_mail() { sleep 1; grep -oE '[0-9]{6}' "$MAIL" | tail -1; }
+  other() { HOME="$SCRATCH_HOME/$1" "$BIN" "${@:2}"; }
+  for u in owner bob newbie; do
+    mkdir -p "$SCRATCH_HOME/$u/.config/simple-social-cli"
+    cp "$SCRATCH_HOME/.config/simple-social-cli/config.ini" "$SCRATCH_HOME/$u/.config/simple-social-cli/"
+  done
+  other owner login owner@test.local 'Passw0rd!' >/dev/null 2>&1
+  other bob login bob@test.local 'Passw0rd!' >/dev/null 2>&1
+
+  echo "== registration with an invite code (local server) =="
+  CODE="$(other owner --json invite --generate | python3 -c 'import sys,json; print(json.load(sys.stdin)["code"])')"
+  [ -n "$CODE" ] && ok || fail "owner could not make a code"
+  out=$(run "register with a wrong code" 1 other newbie --json register 'Wr0ng!xy' newbie@test.local 'Passw0rd!' 'Passw0rd!' --otp 000000 --agree)
+  run "json register without --agree is refused" 1 other newbie --json register "$CODE" newbie@test.local 'Passw0rd!' 'Passw0rd!' --otp 000000 > /dev/null
+  : > "$MAIL"
+  run "send-otp with the code" 0 other newbie --json send-otp newbie@test.local "$CODE" > /dev/null
+  OTP="$(code_from_mail)"
+  run "register" 0 other newbie --json register "$CODE" newbie@test.local 'Passw0rd!' 'Passw0rd!' --otp "$OTP" --agree > /dev/null
+  out=$(run "new member is logged in" 0 other newbie --json whoami)
+  [ "$(json_field "$out" 'd["email"]')" = "newbie@test.local" ] && ok || fail "new member whoami: $out"
+  err="$(other newbie whoami 2>&1 >/dev/null)"
+  case "$err" in *"Terms of Use have changed"*) fail "terms notice after agreeing at registration";; *) ok;; esac
+
+  echo "== password reset (local server) =="
+  : > "$MAIL"
+  run "forgot-password" 0 other bob --json forgot-password bob@test.local > /dev/null
+  OTP="$(code_from_mail)"
+  run "reset-password" 0 other bob --json reset-password bob@test.local "$OTP" 'N3w-Passw0rd!' 'N3w-Passw0rd!' > /dev/null
+  run "login with the new password" 0 other bob --json login bob@test.local 'N3w-Passw0rd!' > /dev/null
+
+  echo "== report, fold, block (local server) =="
+  BPOST="$(other bob --json create "bob's post" | python3 -c 'import sys,json; print(json.load(sys.stdin)["postId"])')"
+  run "report a post" 0 "$BIN" --json report post "$BPOST" spam "test" > /dev/null
+  out=$(run "the post is marked reported" 0 "$BIN" --json post "$BPOST")
+  [ "$(json_field "$out" 'd["post"]["reportedByMe"]')" = "True" ] && ok || fail "reportedByMe: $out"
+  case "$("$BIN" post "$BPOST")" in *"You reported this post"*) ok;; *) fail "post not folded";; esac
+  case "$("$BIN" post "$BPOST" --show-reported)" in *"bob's post"*) ok;; *) fail "--show-reported";; esac
+  run "report with a made-up reason is refused" 1 "$BIN" report post "$BPOST" because > /dev/null
+  run "block" 0 "$BIN" --json block 3 > /dev/null
+  out=$(run "blocked list" 0 "$BIN" --json blocked)
+  [ "$(json_field "$out" '[u["id"] for u in d["users"]]')" = "[3]" ] && ok || fail "blocked list: $out"
+  run "unblock" 0 "$BIN" --json unblock 3 > /dev/null
+
+  echo "== notifications, profile, times (local server) =="
+  out=$(run "profile has a role" 0 "$BIN" --json profile 1)
+  [ "$(json_field "$out" 'd["role"]')" = "owner" ] && ok || fail "profile role: $out"
+  case "$("$BIN" post "$BPOST" --show-reported)" in *"Date:   UTC "*) ok;; *) fail "times not in UTC";; esac
+  out=$(run "post records the poster's GMT offset" 0 "$BIN" --json post "$BPOST")
+  [ "$(json_field "$out" 'd["post"]["timestampTz"]')" = "$(date +%:z)" ] && ok || fail "timestampTz: $out"
+
+  echo "== devices (local server) =="
+  out=$(run "devices" 0 "$BIN" --json devices)
+  [ "$(json_field "$out" 'sum(1 for s in d["sessions"] if s["isCurrent"])')" = "1" ] && ok || fail "devices: $out"
 fi
 
 echo "== error handling =="

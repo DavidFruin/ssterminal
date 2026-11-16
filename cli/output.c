@@ -5,6 +5,7 @@
 
 int g_color_enabled = 0;
 int g_json_enabled = 0;
+int g_show_reported = 0;
 
 const char *C_RESET = "";
 const char *C_BOLD = "";
@@ -45,6 +46,53 @@ static int is_null_media(const char *s) {
     return s[0] == '\0' || strcmp(s, "null") == 0;
 }
 
+// "UTC 2026-09-16 19:20:03 (GMT-06:00)"
+static const char *when(const char *utc, const char *tz) {
+    static char buf[4][64];
+    static int k = 0;
+    k = (k + 1) % 4;
+    api_format_time(utc, tz, buf[k], sizeof(buf[k]));
+    return buf[k];
+}
+
+static void json_str_or_null(const char *s) {
+    if (s && s[0]) json_escape(stdout, s); else printf("null");
+}
+
+// The fields newer servers add to a post, appended to its JSON object
+// (existing fields are never renamed or removed: scripts depend on them).
+static void post_extra_json(const api_post_t *p) {
+    printf(",\"timestampTz\":");
+    json_str_or_null(p->timestamp_tz);
+    printf(",\"commentCount\":%d,\"reportedByMe\":%s,\"frozen\":%s",
+           p->comment_count, p->reported_by_me ? "true" : "false", p->frozen ? "true" : "false");
+    if (p->media_type[0]) {
+        printf(",\"media\":{\"type\":");
+        json_escape(stdout, p->media_type);
+        printf(",\"url\":");
+        json_str_or_null(p->media_url);
+        printf(",\"variantUrl\":");
+        json_str_or_null(p->media_variant);
+        printf(",\"posterUrl\":");
+        json_str_or_null(p->media_poster);
+        printf(",\"loop\":%s}", p->media_loop ? "true" : "false");
+    }
+}
+
+// What a post's media is, in words: "video", "GIF (plays as a loop)".
+static const char *media_kind(const api_post_t *p) {
+    if (p->media_loop) return "GIF (plays as a loop)";
+    if (p->media_type[0]) return p->media_type;
+    return "media";
+}
+
+// The text as a list or detail view shows it: folded when you reported it
+// (unless --show-reported), labelled when staff hid your own post.
+static const char *post_text_view(const api_post_t *p) {
+    if (p->reported_by_me && !g_show_reported) return "(You reported this post. Add --show-reported to see it.)";
+    return p->text;
+}
+
 void print_posts(const api_posts_result_t *result) {
     if (g_json_enabled) {
         printf("{\"posts\":[");
@@ -61,7 +109,9 @@ void print_posts(const api_posts_result_t *result) {
             json_escape(stdout, p->user_email);
             printf(",\"likeCount\":%d,\"isLiked\":%s", p->like_count, p->is_liked ? "true" : "false");
             if (!is_null_media(p->media_url)) { printf(",\"mediaUrl\":"); json_escape(stdout, p->media_url); } else printf(",\"mediaUrl\":null");
-            printf(",\"likes\":%d}", p->like_count);
+            printf(",\"likes\":%d", p->like_count);
+            post_extra_json(p);
+            printf("}");
         }
         printf("],\"hasMore\":%s,\"totalCount\":%d}\n", result->has_more ? "true" : "false", result->total_count);
         return;
@@ -76,9 +126,12 @@ void print_posts(const api_posts_result_t *result) {
     printf("%s\n", C_RESET);
     for (int i = 0; i < result->count; i++) {
         const api_post_t *p = &result->posts[i];
-        char text[41] = {0};
-        strncpy(text, p->text, 40);
-        if (strlen(p->text) > 40) strcpy(text + 37, "...");
+        char shown[5100];
+        snprintf(shown, sizeof(shown), "%s%s%s", p->frozen ? "[Hidden by a moderator] " : "",
+                 post_text_view(p), (!is_null_media(p->media_url) && !(p->reported_by_me && !g_show_reported)) ? " [media]" : "");
+        char text[41];
+        snprintf(text, sizeof(text), "%.40s", shown);
+        if (strlen(shown) > 40) strcpy(text + 37, "...");
         char id_short[11] = {0};
         strncpy(id_short, p->id, 10);
         if (strlen(p->id) > 10) strcpy(id_short + 7, "...");
@@ -101,19 +154,25 @@ void print_post(const api_post_t *post) {
         json_escape(stdout, post->user_email);
         printf(",\"likeCount\":%d,\"isLiked\":%s", post->like_count, post->is_liked ? "true" : "false");
         if (!is_null_media(post->media_url)) { printf(",\"mediaUrl\":"); json_escape(stdout, post->media_url); } else printf(",\"mediaUrl\":null");
+        post_extra_json(post);
         printf("}}\n");
         return;
     }
     printf("%sPost:%s %s\n", C_BOLD, C_RESET, post->id);
     printf("%sAuthor:%s %s (ID: %d)\n", C_BOLD, C_RESET, post->user_email, post->user_id);
-    printf("%sDate:%s   %s\n", C_BOLD, C_RESET, post->timestamp);
-    printf("%sLikes:%s  %d", C_BOLD, C_RESET, post->like_count);
-    if (post->is_liked)
-        printf(" %s(you liked this)%s", C_GREEN, C_RESET);
-    printf("\n");
-    if (!is_null_media(post->media_url))
-        printf("%sMedia:%s  %s\n", C_BOLD, C_RESET, post->media_url);
-    printf("\n%s%s%s\n", C_BOLD, post->text, C_RESET);
+    printf("%sDate:%s   %s\n", C_BOLD, C_RESET, when(post->timestamp, post->timestamp_tz));
+    if (post->frozen) {
+        printf("%sHidden by a moderator.%s Only you can see this post. It can't be liked or commented on.\n", C_YELLOW, C_RESET);
+    } else {
+        printf("%sLikes:%s  %d", C_BOLD, C_RESET, post->like_count);
+        if (post->is_liked)
+            printf(" %s(you liked this)%s", C_GREEN, C_RESET);
+        printf("    %sComments:%s %d\n", C_BOLD, C_RESET, post->comment_count);
+    }
+    int folded = post->reported_by_me && !g_show_reported;
+    if (!is_null_media(post->media_url) && !folded)
+        printf("%sMedia:%s  %s  %s\n", C_BOLD, C_RESET, media_kind(post), post->media_url);
+    printf("\n%s%s%s\n", folded ? C_DIM : C_BOLD, post_text_view(post), C_RESET);
 }
 
 void print_users(const api_users_result_t *result) {
@@ -126,6 +185,7 @@ void print_users(const api_users_result_t *result) {
             json_escape(stdout, u->email);
             printf(",\"created_at\":");
             json_escape(stdout, u->created_at);
+            if (u->created_tz[0]) { printf(",\"created_tz\":"); json_escape(stdout, u->created_tz); }
             printf("}");
         }
         printf("]}\n");
@@ -141,7 +201,7 @@ void print_users(const api_users_result_t *result) {
     printf("%s\n", C_RESET);
     for (int i = 0; i < result->count; i++) {
         const api_user_t *u = &result->users[i];
-        printf("%-6d  %-40s  %s\n", u->id, u->email, u->created_at);
+        printf("%-6d  %-40s  %s\n", u->id, u->email, when(u->created_at, u->created_tz));
     }
 }
 
@@ -177,7 +237,7 @@ void print_user_info(int id, const char *email, const char *created_at) {
     }
     printf("%sID:%s     %d\n", C_BOLD, C_RESET, id);
     printf("%sEmail:%s  %s\n", C_BOLD, C_RESET, email);
-    printf("%sJoined:%s %s\n", C_BOLD, C_RESET, created_at);
+    printf("%sJoined:%s %s\n", C_BOLD, C_RESET, when(created_at, NULL));
 }
 
 void print_comments(const api_comments_result_t *result) {
@@ -192,7 +252,13 @@ void print_comments(const api_comments_result_t *result) {
             json_escape(stdout, c->text);
             printf(",\"created_at\":");
             json_escape(stdout, c->created_at);
-            printf("}");
+            printf(",\"created_tz\":");
+            json_str_or_null(c->created_tz);
+            printf(",\"parent_id\":");
+            if (c->parent_id) printf("%d", c->parent_id); else printf("null");
+            printf(",\"replyCount\":%d,\"deleted\":%s,\"frozenByStaff\":%s,\"frozen\":%s,\"reportedByMe\":%s}",
+                   c->reply_count, c->deleted ? "true" : "false", c->frozen_by_staff ? "true" : "false",
+                   c->frozen ? "true" : "false", c->reported_by_me ? "true" : "false");
         }
         printf("],\"hasMore\":%s,\"totalCount\":%d}\n", result->has_more ? "true" : "false", result->total_count);
         return;
@@ -203,11 +269,33 @@ void print_comments(const api_comments_result_t *result) {
     }
     for (int i = 0; i < result->count; i++) {
         const api_comment_t *c = &result->comments[i];
-        printf("  %s[%d]%s %s%s (%s)%s: %s\n",
-               C_DIM, c->id, C_RESET,
-               C_CYAN, c->user_email, c->created_at, C_RESET,
-               c->text);
+        const char *indent = c->parent_id ? "      \xe2\x86\xb3 " : "  ";   // "↳" under its comment
+        if (c->deleted) { printf("%s%s[%d] Comment deleted%s\n", indent, C_DIM, c->id, C_RESET); continue; }
+        if (c->frozen_by_staff) { printf("%s%s[%d] Comment frozen by staff%s\n", indent, C_DIM, c->id, C_RESET); continue; }
+        const char *text = c->text;
+        if (c->reported_by_me && !g_show_reported) text = "(You reported this comment. Add --show-reported to see it.)";
+        printf("%s%s[%d]%s %s%s (%s)%s: %s%s\n",
+               indent, C_DIM, c->id, C_RESET,
+               C_CYAN, c->user_email, when(c->created_at, c->created_tz), C_RESET,
+               c->frozen ? "[Hidden by a moderator] " : "", text);
     }
+    if (result->truncated) printf("%s(Some replies weren't shown: too many to list.)%s\n", C_DIM, C_RESET);
+}
+
+// One sentence per notification type the server sends; anything newer
+// still gets a line rather than nothing.
+static void notification_sentence(const api_notification_t *n, char *out, int size) {
+    const char *a = n->actor_email[0] ? n->actor_email : "Someone";
+    const char *t = n->type;
+    if (!strcmp(t, "like")) snprintf(out, size, "%s liked your post", a);
+    else if (!strcmp(t, "unlike")) snprintf(out, size, "%s unliked your post", a);
+    else if (!strcmp(t, "comment")) snprintf(out, size, "%s commented on your post", a);
+    else if (!strcmp(t, "reply")) snprintf(out, size, "%s replied to your comment", a);
+    else if (!strcmp(t, "thread_reply")) snprintf(out, size, "%s also replied in a thread you replied in", a);
+    else if (!strcmp(t, "follow")) snprintf(out, size, "%s started following you", a);
+    else if (!strcmp(t, "unfollow")) snprintf(out, size, "%s unfollowed you", a);
+    else if (!strcmp(t, "mention")) snprintf(out, size, "%s mentioned you", a);
+    else snprintf(out, size, "%s did something", a);
 }
 
 void print_notifications(const api_notifications_result_t *result) {
@@ -224,7 +312,11 @@ void print_notifications(const api_notifications_result_t *result) {
             if (n->post_id[0]) json_escape(stdout, n->post_id); else printf("null");
             printf(",\"created_at\":");
             json_escape(stdout, n->created_at);
-            printf("}");
+            printf(",\"created_tz\":");
+            json_str_or_null(n->created_tz);
+            printf(",\"comment_id\":");
+            if (n->comment_id) printf("%d", n->comment_id); else printf("null");
+            printf(",\"seen\":%s}", n->seen ? "true" : "false");
         }
         printf("]}\n");
         return;
@@ -233,37 +325,42 @@ void print_notifications(const api_notifications_result_t *result) {
         printf("No notifications.\n");
         return;
     }
-    printf("%s%-12s  %-40s  %-20s  %s%s\n", C_BOLD, "Type", "Actor", "Post", "Date", C_RESET);
-    printf("%s", C_DIM);
-    for (int i = 0; i < 80; i++) putchar('-');
-    printf("%s\n", C_RESET);
     for (int i = 0; i < result->count; i++) {
         const api_notification_t *n = &result->notifications[i];
-        const char *type_color = C_RESET;
-        if (strcmp(n->type, "like") == 0 || strcmp(n->type, "unlike") == 0) type_color = C_YELLOW;
-        else if (strcmp(n->type, "follow") == 0 || strcmp(n->type, "unfollow") == 0) type_color = C_CYAN;
-        else if (strcmp(n->type, "comment") == 0) type_color = C_GREEN;
-        printf("%s%-12s%s  %-40s  %-20s  %s\n",
-               type_color, n->type, C_RESET,
-               n->actor_email,
-               n->post_id[0] ? n->post_id : "-",
-               n->created_at);
+        char sentence[400];
+        notification_sentence(n, sentence, sizeof(sentence));
+        printf("%s%s%s  %s%s", n->seen ? "" : C_BOLD, sentence, C_RESET, C_DIM, when(n->created_at, n->created_tz));
+        if (n->post_id[0]) printf("  post %s", n->post_id);
+        if (n->comment_id) printf(" comment %d", n->comment_id);
+        printf("%s\n", C_RESET);
     }
 }
 
+// "Owner", "Admin", "Moderator", "User": the public badge on every profile.
+const char *role_label(const char *role) {
+    if (!role) return "User";
+    if (!strcmp(role, "owner")) return "Owner";
+    if (!strcmp(role, "admin")) return "Admin";
+    if (!strcmp(role, "moderator")) return "Moderator";
+    return "User";
+}
+
 void print_profile(int user_id, const char *email, const char *created_at,
-                   int follower_count, int following_count) {
+                   int follower_count, int following_count, const char *role) {
     if (g_json_enabled) {
         printf("{\"id\":%d,\"email\":", user_id);
         json_escape(stdout, email);
         printf(",\"created_at\":");
         json_escape(stdout, created_at);
-        printf(",\"followers\":%d,\"following\":%d}\n", follower_count, following_count);
+        printf(",\"followers\":%d,\"following\":%d,\"role\":", follower_count, following_count);
+        json_escape(stdout, role && role[0] ? role : "user");
+        printf("}\n");
         return;
     }
     printf("%sID:%s         %d\n", C_BOLD, C_RESET, user_id);
     printf("%sEmail:%s      %s\n", C_BOLD, C_RESET, email);
-    printf("%sJoined:%s     %s\n", C_BOLD, C_RESET, created_at);
+    printf("%sRole:%s       %s\n", C_BOLD, C_RESET, role_label(role));
+    printf("%sJoined:%s     %s\n", C_BOLD, C_RESET, when(created_at, NULL));
     printf("%sFollowers:%s  %d\n", C_BOLD, C_RESET, follower_count);
     printf("%sFollowing:%s  %d\n", C_BOLD, C_RESET, following_count);
 }

@@ -10,6 +10,12 @@
 #include <ctype.h>
 
 static ss_state_t state;
+static api_me_t me;          // filled by auto_login()
+static int me_loaded = 0;
+
+// The website's Terms of Use and the age rule, asked at registration and
+// whenever the terms change (the web and phone apps ask the same).
+#define TERMS_QUESTION "I agree to the Terms of Use (%s) and I'm at least 13 years old"
 
 // Persists an access token the library renewed on its own, so the next
 // command starts with a live one instead of refreshing all over again.
@@ -38,17 +44,55 @@ static void auto_login(void) {
 
     if (ss_state_load_jwt(&state) == 0) {
         api_set_jwt(state.jwt);
-        int id = 0;
-        char email[256] = {0};
-        char created[32] = {0};
-        if (api_get_my_info(&id, email, sizeof(email), created, sizeof(created)) == 0) {
-            ss_state_set_user(&state, id, email, created);
-            api_set_user_id(id);
+        if (api_get_me(&me) == 0) {
+            me_loaded = 1;
+            ss_state_set_user(&state, me.id, me.email, me.created_at);
+            api_set_user_id(me.id);
             return;
         }
         ss_state_clear(&state);
     }
 }
+
+// Shown once per login, the first time a command runs after it, then
+// cleared on the server. Same words as the website.
+static void show_welcome_once(void) {
+    if (!me_loaded || !me.has_welcome || g_json_enabled) return;
+    if (me.welcome_inviter[0] && me.welcome_inviter_is_owner)
+        fprintf(stderr, "%sWelcome to Simple Social!%s You were invited by %s, who runs Simple Social.\n", C_BOLD, C_RESET, me.welcome_inviter);
+    else if (me.welcome_inviter[0])
+        fprintf(stderr, "%sWelcome to Simple Social!%s %s used their only invite on you, so use yours just as wisely.\n", C_BOLD, C_RESET, me.welcome_inviter);
+    else
+        fprintf(stderr, "%sWelcome to Simple Social!%s\n", C_BOLD, C_RESET);
+    api_dismiss_welcome();
+}
+
+// Until the current terms are accepted, every command says so on stderr
+// (never on stdout, so --json output stays clean).
+static void terms_notice(void) {
+    if (!me_loaded || me.terms_current <= 0 || me.terms_accepted >= me.terms_current) return;
+    fprintf(stderr, "%sNotice:%s the Terms of Use have changed. Read them at %s and run: simple-social-cli accept-terms\n",
+            C_YELLOW, C_RESET, me.terms_url);
+}
+
+// "UTC 2026-09-16 19:20:03 (GMT-06:00)"
+static const char *when(const char *utc, const char *tz) {
+    static char buf[4][64];
+    static int k = 0;
+    k = (k + 1) % 4;
+    api_format_time(utc, tz, buf[k], sizeof(buf[k]));
+    return buf[k];
+}
+
+// Reads one line from stdin into out. Returns 0 on a line, -1 on end of input.
+static int read_line(const char *prompt, char *out, int size) {
+    if (prompt) fprintf(stderr, "%s", prompt);
+    if (!fgets(out, size, stdin)) return -1;
+    out[strcspn(out, "\r\n")] = '\0';
+    return 0;
+}
+
+static int check_media_before_upload(const char *path);
 
 static int require_auth(void) {
     if (!ss_state_is_logged_in(&state)) {
@@ -58,22 +102,14 @@ static int require_auth(void) {
     return 0;
 }
 
-static int cmd_login(int argc, char **argv) {
-    if (argc < 2) { fprintf(stderr, "Usage: simple-social-cli login <email> <password>\n"); return 1; }
-    const char *email = argv[0];
-    const char *password = argv[1];
-
-    config_t cfg;
-    config_load(&cfg);
-    api_init();
-
+// Logs in and saves the session. Returns 0 or -1 (error already shown).
+static int do_login(const char *email, const char *password) {
     char jwt[1024] = {0};
     int user_id = 0;
     if (api_login(email, password, jwt, sizeof(jwt), &user_id) != 0) {
         print_error(api_get_last_error());
-        return 1;
+        return -1;
     }
-
     ss_state_set_jwt(&state, jwt);
     api_set_jwt(jwt);
     api_set_user_id(user_id);
@@ -82,14 +118,22 @@ static int cmd_login(int argc, char **argv) {
     // lifetime, which is the whole thing this is meant to avoid.
     ss_state_set_refresh(&state, api_get_refresh_token());
     ss_state_save_refresh(&state);
-
-    char email_out[256] = {0};
-    char created[32] = {0};
-    api_get_my_info(&user_id, email_out, sizeof(email_out), created, sizeof(created));
-    ss_state_set_user(&state, user_id, email_out, created);
+    if (api_get_me(&me) == 0) me_loaded = 1;
+    ss_state_set_user(&state, me.id ? me.id : user_id, me.email, me.created_at);
     ss_state_save_user(&state);
+    return 0;
+}
 
-    if (g_json_enabled) printf("{\"ok\":true,\"userId\":%d,\"email\":\"%s\"}\n", user_id, email_out); else fprintf(stderr, "Logged in as %s (ID: %d)\n", email_out, user_id);
+static int cmd_login(int argc, char **argv) {
+    if (argc < 2) { fprintf(stderr, "Usage: simple-social-cli login <email> <password>\n"); return 1; }
+    config_t cfg;
+    config_load(&cfg);
+    api_init();
+    if (do_login(argv[0], argv[1]) != 0) return 1;
+    if (g_json_enabled) printf("{\"ok\":true,\"userId\":%d,\"email\":\"%s\"}\n", state.user.user_id, state.user.email);
+    else fprintf(stderr, "Logged in as %s (ID: %d)\n", state.user.email, state.user.user_id);
+    show_welcome_once();
+    terms_notice();
     return 0;
 }
 
@@ -110,42 +154,127 @@ static int cmd_whoami(int argc, char **argv) {
     (void)argc; (void)argv;
     if (require_auth() != 0) return 1;
     print_user_info(state.user.user_id, state.user.email, state.user.created_at);
+    if (!g_json_enabled) {
+        if (me_loaded) printf("%sRole:%s   %s\n", C_BOLD, C_RESET, role_label(me.role));
+        api_media_limits_t lim;
+        if (api_get_media_limits(&lim) == 0 && lim.storage_limit > 0)
+            printf("%sMedia:%s  %.1f MB of %.0f MB used\n", C_BOLD, C_RESET,
+                   lim.storage_used / 1048576.0, lim.storage_limit / 1048576.0);
+    }
     return 0;
 }
 
+// Asks the age-and-terms question. --agree answers it for scripts; --json
+// mode never prompts, so it needs --agree.
+static int ask_terms(const char *terms_url, int agreed_by_flag) {
+    if (agreed_by_flag) return 0;
+    if (g_json_enabled) { print_error("Add --agree to accept the Terms of Use and confirm you are at least 13."); return -1; }
+    char q[512], answer[16];
+    snprintf(q, sizeof(q), TERMS_QUESTION "? [y/N] ", terms_url);
+    if (read_line(q, answer, sizeof(answer)) != 0 || (answer[0] != 'y' && answer[0] != 'Y')) {
+        print_error("You need to agree to the Terms of Use and be at least 13 to join.");
+        return -1;
+    }
+    return 0;
+}
+
+// The one-time code from the email: --otp, or asked for.
+static int get_otp(const char *given, char *out, int size) {
+    if (given) { snprintf(out, size, "%s", given); return 0; }
+    if (g_json_enabled) { print_error("Add --otp <code> (the 6-digit code from the email)."); return -1; }
+    return read_line("Code from the email: ", out, size);
+}
+
+// register <invite code> <email> <password> <confirm> [--otp CODE] [--agree]
+// The code comes first, as on the website: it is checked (and who invited
+// you shown) before anything is sent. Older form, for a server with open
+// registration: register <email> <otp> <password> <confirm>, after send-otp.
 static int cmd_register(int argc, char **argv) {
-    if (argc < 4) { fprintf(stderr, "Usage: simple-social-cli register <email> <otp> <password> <confirm>\n"); return 1; }
-    const char *email = argv[0];
-    const char *otp = argv[1];
-    const char *password = argv[2];
-    const char *confirm = argv[3];
+    const char *usage = "Usage: simple-social-cli register <invite code> <email> <password> <confirm> [--otp CODE] [--agree]\n";
+    const char *otp_flag = NULL;
+    int agree = 0;
+    char *pos[8];
+    int npos = 0;
+    for (int i = 0; i < argc; i++) {
+        if (strcmp(argv[i], "--otp") == 0 && i + 1 < argc) otp_flag = argv[++i];
+        else if (strcmp(argv[i], "--agree") == 0) agree = 1;
+        else if (npos < 8) pos[npos++] = argv[i];
+    }
+    if (npos < 4) { fprintf(stderr, "%s", usage); return 1; }
 
     config_t cfg;
     config_load(&cfg);
     api_init();
+    char terms_url[256];
+    api_site_url("/terms", terms_url, sizeof(terms_url));
 
-    if (api_register_verify_otp(email, otp) != 0) {
-        print_error(api_get_last_error());
-        return 1;
+    if (strchr(pos[0], '@') && !strchr(pos[1], '@')) {
+        // The older form: the code was already sent with send-otp.
+        if (ask_terms(terms_url, agree) != 0) return 1;
+        if (api_register_verify_otp(pos[0], pos[1]) != 0 || api_register_finish(pos[0], pos[2], pos[3]) != 0) {
+            print_error(api_get_last_error());
+            return 1;
+        }
+    } else {
+        const char *code = pos[0], *email = pos[1];
+        char inviter[256] = {0}, expires[32] = {0};
+        if (api_check_invite_code(code, inviter, sizeof(inviter), expires, sizeof(expires)) != 0) {
+            print_error(api_get_last_error());
+            return 1;
+        }
+        if (!g_json_enabled) fprintf(stderr, "Invited by %s.\n", inviter[0] ? inviter : "a member");
+        if (ask_terms(terms_url, agree) != 0) return 1;
+        // With --otp the code was already sent (send-otp <email> <invite
+        // code>); sending another would replace it. Without it, send it now
+        // and ask for it, which needs a person at the keyboard.
+        if (!otp_flag) {
+            if (g_json_enabled) { print_error("In --json mode, first run send-otp <email> <invite code>, then register again with --otp <code>."); return 1; }
+            if (api_register_send_otp(email, code) != 0) { print_error(api_get_last_error()); return 1; }
+            fprintf(stderr, "We emailed a 6-digit code to %s.\n", email);
+        }
+        char otp[32];
+        if (get_otp(otp_flag, otp, sizeof(otp)) != 0) return 1;
+        if (api_register_verify_otp(email, otp) != 0 || api_register_finish(email, pos[2], pos[3]) != 0) {
+            print_error(api_get_last_error());
+            return 1;
+        }
     }
-    if (api_register_finish(email, password, confirm) != 0) {
-        print_error(api_get_last_error());
-        return 1;
+    // The terms were agreed to above: log in and record that, as the
+    // website does on the new member's first sign-in.
+    const char *email = strchr(pos[0], '@') && !strchr(pos[1], '@') ? pos[0] : pos[1];
+    if (do_login(email, pos[2]) == 0 && me.terms_current > 0) {
+        api_accept_terms(me.terms_current);
+        me.terms_accepted = me.terms_current;
     }
-    if (g_json_enabled) printf("{\"ok\":true}\n"); else fprintf(stderr, "Registration complete. You can now login.\n");
+    if (g_json_enabled) printf("{\"ok\":true}\n");
+    else fprintf(stderr, "Registration complete. You're logged in as %s.\n", email);
+    show_welcome_once();
     return 0;
 }
 
+// send-otp <email> [invite code]: sends the registration code.
 static int cmd_send_otp(int argc, char **argv) {
-    if (argc < 1) { fprintf(stderr, "Usage: simple-social-cli send-otp <email>\n"); return 1; }
+    if (argc < 1) { fprintf(stderr, "Usage: simple-social-cli send-otp <email> [invite code]\n"); return 1; }
     config_t cfg;
     config_load(&cfg);
     api_init();
-    if (api_register_send_otp(argv[0], NULL) != 0) {
+    if (api_register_send_otp(argv[0], argc > 1 ? argv[1] : NULL) != 0) {
         print_error(api_get_last_error());
         return 1;
     }
     if (g_json_enabled) printf("{\"ok\":true}\n"); else fprintf(stderr, "OTP sent to %s\n", argv[0]);
+    return 0;
+}
+
+// forgot-password <email>: emails a password reset code.
+static int cmd_forgot_password(int argc, char **argv) {
+    if (argc < 1) { fprintf(stderr, "Usage: simple-social-cli forgot-password <email>\n"); return 1; }
+    config_t cfg;
+    config_load(&cfg);
+    api_init();
+    if (api_send_otp(argv[0]) != 0) { print_error(api_get_last_error()); return 1; }
+    if (g_json_enabled) printf("{\"ok\":true}\n");
+    else fprintf(stderr, "If %s has an account, a code is on its way. Then run: simple-social-cli reset-password %s <code> <new password> <confirm>\n", argv[0], argv[0]);
     return 0;
 }
 
@@ -154,6 +283,7 @@ static int cmd_reset_password(int argc, char **argv) {
     config_t cfg;
     config_load(&cfg);
     api_init();
+    // Both steps in one run: the token verify returns lives in this process.
     if (api_verify_otp(argv[0], argv[1]) != 0) {
         print_error(api_get_last_error());
         return 1;
@@ -163,6 +293,28 @@ static int cmd_reset_password(int argc, char **argv) {
         return 1;
     }
     if (g_json_enabled) printf("{\"ok\":true}\n"); else fprintf(stderr, "Password reset. You can now login.\n");
+    return 0;
+}
+
+static int cmd_accept_terms(int argc, char **argv) {
+    (void)argc; (void)argv;
+    if (require_auth() != 0) return 1;
+    if (!me_loaded || me.terms_current <= 0) { print_error("Could not read the current terms version."); return 1; }
+    if (me.terms_accepted >= me.terms_current) {
+        if (g_json_enabled) printf("{\"ok\":true,\"version\":%d}\n", me.terms_current); else fprintf(stderr, "You have already accepted the current Terms of Use.\n");
+        return 0;
+    }
+    if (!g_json_enabled) {
+        char q[512], answer[16];
+        snprintf(q, sizeof(q), TERMS_QUESTION "? [y/N] ", me.terms_url);
+        if (read_line(q, answer, sizeof(answer)) != 0 || (answer[0] != 'y' && answer[0] != 'Y')) {
+            print_error("Not accepted.");
+            return 1;
+        }
+    }
+    if (api_accept_terms(me.terms_current) != 0) { print_error(api_get_last_error()); return 1; }
+    me.terms_accepted = me.terms_current;
+    if (g_json_enabled) printf("{\"ok\":true,\"version\":%d}\n", me.terms_current); else fprintf(stderr, "Thank you. The Terms of Use are accepted.\n");
     return 0;
 }
 
@@ -192,9 +344,10 @@ static int cmd_post(int argc, char **argv) {
     }
     print_post(&post);
 
-    api_comments_result_t comments;
-    if (api_get_post_comments(argv[0], 0, 25, &comments) == 0 && comments.count > 0) {
-        printf("\n%sComments (%d):%s\n", C_BOLD, comments.count, C_RESET);
+    if (g_json_enabled || post.frozen) return 0;
+    static api_comments_result_t comments;   // ~1.4 MB: not on the stack
+    if (api_get_post_comments_threaded(argv[0], 0, 25, &comments) == 0 && comments.count > 0) {
+        printf("\n%sComments:%s\n", C_BOLD, C_RESET);
         print_comments(&comments);
     }
     return 0;
@@ -237,6 +390,7 @@ static int cmd_create(int argc, char **argv) {
             print_error(msg);
             return 1;
         }
+        if (check_media_before_upload(media_file) != 0) return 1;
         if (api_upload_media_with_id(media_file, media_url, sizeof(media_url), &media_id) != 0) {
             print_error(api_get_last_error());
             return 1;
@@ -340,15 +494,20 @@ static int cmd_unlike(int argc, char **argv) {
 }
 
 static int cmd_comments(int argc, char **argv) {
-    if (argc < 1) { fprintf(stderr, "Usage: simple-social-cli comments <post_id> [--offset N]\n"); return 1; }
+    if (argc < 1) { fprintf(stderr, "Usage: simple-social-cli comments <post_id> [--offset N] [--flat]\n"); return 1; }
     if (require_auth() != 0) return 1;
     const char *post_id = argv[0];
     int offset = 0;
     for (int i = 1; i < argc; i++) {
         if (strcmp(argv[i], "--offset") == 0 && i + 1 < argc) offset = atoi(argv[++i]);
     }
-    api_comments_result_t result;
-    if (api_get_post_comments(post_id, offset, 25, &result) != 0) {
+    // Threads: each comment followed by its replies. --flat is the old list.
+    static api_comments_result_t result;
+    int flat = 0;
+    for (int i = 1; i < argc; i++) if (strcmp(argv[i], "--flat") == 0) flat = 1;
+    int rc = flat ? api_get_post_comments(post_id, offset, 25, &result)
+                  : api_get_post_comments_threaded(post_id, offset, 25, &result);
+    if (rc != 0) {
         print_error(api_get_last_error());
         return 1;
     }
@@ -420,9 +579,13 @@ static int cmd_profile(int argc, char **argv) {
     api_get_my_followers(user_id, &followers);
     api_get_my_follows(user_id, &following);
 
-    print_profile(user_id, email, created, followers.count, following.count);
+    char role[16] = "user";
+    api_get_user_role(user_id, role, sizeof(role));
+    print_profile(user_id, email, created, followers.count, following.count, role);
 
-    if (user_id != state.user.user_id) {
+    // Human mode only: in --json mode this extra line used to follow the
+    // JSON object and made the output unparseable.
+    if (user_id != state.user.user_id && !g_json_enabled) {
         int is_following = 0;
         api_is_following(user_id, &is_following);
         printf("%sFollowing:%s  %s\n", C_BOLD, C_RESET, is_following ? "Yes" : "No");
@@ -529,6 +692,211 @@ static int cmd_delete_account(int argc, char **argv) {
     return 0;
 }
 
+// The checks the website makes before an upload: the file's size against
+// the limit for its kind, whether the server can take video and audio right
+// now, and room left in the account's storage. The server checks again.
+static int check_media_before_upload(const char *path) {
+    api_media_limits_t lim;
+    if (api_get_media_limits(&lim) != 0) return 0;   // let the server decide
+    FILE *f = fopen(path, "rb");
+    if (!f) return 0;
+    fseek(f, 0, SEEK_END);
+    long long size = ftell(f);
+    fclose(f);
+    const char *dot = strrchr(path, '.');
+    char ext[16] = {0};
+    if (dot) for (int i = 0; dot[i + 1] && i < 15; i++) ext[i] = (char)tolower((unsigned char)dot[i + 1]);
+    int video = !strcmp(ext, "mp4") || !strcmp(ext, "mov") || !strcmp(ext, "m4v") || !strcmp(ext, "webm") || !strcmp(ext, "mkv") || !strcmp(ext, "3gp");
+    int audio = !strcmp(ext, "mp3") || !strcmp(ext, "wav") || !strcmp(ext, "m4a") || !strcmp(ext, "ogg") || !strcmp(ext, "opus") || !strcmp(ext, "flac") || !strcmp(ext, "aac") || !strcmp(ext, "amr") || !strcmp(ext, "aiff");
+    char msg[256];
+    if (video && !lim.video_supported) { print_error("Video uploads aren't available on the server right now."); return -1; }
+    if (audio && !lim.audio_supported) { print_error("Audio uploads aren't available on the server right now."); return -1; }
+    long long max = video ? lim.max_video_bytes : audio ? lim.max_audio_bytes : lim.max_image_bytes;
+    if (max > 0 && size > max) {
+        snprintf(msg, sizeof(msg), "That file is too large. The limit for %s is %lld MB.", video ? "video" : audio ? "audio" : "images", max / 1048576);
+        print_error(msg);
+        return -1;
+    }
+    if (lim.storage_limit > 0 && lim.storage_used + size > lim.storage_limit) {
+        // The website's wording, with the limit as the server has it set.
+        if (lim.storage_limit % 1073741824LL == 0)
+            snprintf(msg, sizeof(msg), "You have reached your media storage limit of %lld GB of media.", lim.storage_limit / 1073741824LL);
+        else
+            snprintf(msg, sizeof(msg), "You have reached your media storage limit of %lld MB of media.", lim.storage_limit / 1048576LL);
+        print_error(msg);
+        return -1;
+    }
+    return 0;
+}
+
+// Joins argv[from..] with spaces.
+static void join_args(int argc, char **argv, int from, char *out, size_t size) {
+    size_t pos = 0;
+    out[0] = '\0';
+    for (int i = from; i < argc && pos < size - 1; i++) {
+        int n = snprintf(out + pos, size - pos, "%s%s", i > from ? " " : "", argv[i]);
+        if (n < 0) break;
+        pos += (size_t)n;
+        if (pos >= size) { pos = size - 1; break; }
+    }
+}
+
+// reply <post_id> <comment_id> <text>: a reply goes under a top-level comment.
+static int cmd_reply(int argc, char **argv) {
+    if (argc < 3) { fprintf(stderr, "Usage: simple-social-cli reply <post_id> <comment_id> <text>\n"); return 1; }
+    if (require_auth() != 0) return 1;
+    char text[5000];
+    join_args(argc, argv, 2, text, sizeof(text));
+    int id = 0;
+    if (api_create_reply(argv[0], atoi(argv[1]), text, &id) != 0) { print_error(api_get_last_error()); return 1; }
+    if (g_json_enabled) printf("{\"commentId\":%d,\"postId\":\"%s\",\"parentId\":%d}\n", id, argv[0], atoi(argv[1]));
+    else fprintf(stderr, "Reply %d added under comment %s\n", id, argv[1]);
+    return 0;
+}
+
+// report post|comment|user <id> <reason> [details]
+static int cmd_report(int argc, char **argv) {
+    const char *usage = "Usage: simple-social-cli report post|comment|user <id> <reason> [details]\n"
+                        "Reasons: spam, harassment, hate, sexual, violence, self_harm, illegal, other\n";
+    if (argc < 3) { fprintf(stderr, "%s", usage); return 1; }
+    if (require_auth() != 0) return 1;
+    if (strcmp(argv[0], "post") && strcmp(argv[0], "comment") && strcmp(argv[0], "user")) { fprintf(stderr, "%s", usage); return 1; }
+    int ok = 0;
+    for (int i = 0; api_report_reasons[i]; i++) if (!strcmp(argv[2], api_report_reasons[i])) ok = 1;
+    if (!ok) { fprintf(stderr, "%s", usage); return 1; }
+    char details[600];
+    join_args(argc, argv, 3, details, sizeof(details));
+    if (api_report(argv[0], argv[1], argv[2], details) != 0) { print_error(api_get_last_error()); return 1; }
+    if (g_json_enabled) printf("{\"reported\":true,\"targetType\":\"%s\",\"targetId\":\"%s\"}\n", argv[0], argv[1]);
+    else fprintf(stderr, "Thank you. The report was sent to the moderators.%s\n",
+                 strcmp(argv[0], "user") ? " It is folded away for you now." : "");
+    return 0;
+}
+
+static int cmd_block(int argc, char **argv) {
+    if (argc < 1) { fprintf(stderr, "Usage: simple-social-cli block <user_id>\n"); return 1; }
+    if (require_auth() != 0) return 1;
+    if (api_block_user(atoi(argv[0])) != 0) { print_error(api_get_last_error()); return 1; }
+    if (g_json_enabled) printf("{\"blocked\":true,\"userId\":%d}\n", atoi(argv[0]));
+    else fprintf(stderr, "Blocked user %s. Neither of you will see the other's posts, comments or profile.\n", argv[0]);
+    return 0;
+}
+
+static int cmd_unblock(int argc, char **argv) {
+    if (argc < 1) { fprintf(stderr, "Usage: simple-social-cli unblock <user_id>\n"); return 1; }
+    if (require_auth() != 0) return 1;
+    if (api_unblock_user(atoi(argv[0])) != 0) { print_error(api_get_last_error()); return 1; }
+    if (g_json_enabled) printf("{\"blocked\":false,\"userId\":%d}\n", atoi(argv[0]));
+    else fprintf(stderr, "Unblocked user %s.\n", argv[0]);
+    return 0;
+}
+
+static int cmd_blocked(int argc, char **argv) {
+    (void)argc; (void)argv;
+    if (require_auth() != 0) return 1;
+    static api_users_result_t res;
+    if (api_get_blocked_users(&res) != 0) { print_error(api_get_last_error()); return 1; }
+    if (!g_json_enabled && res.count == 0) { fprintf(stderr, "You haven't blocked anyone.\n"); return 0; }
+    print_users(&res);
+    return 0;
+}
+
+// invite                 your invite state and live code(s)
+// invite --generate      make a code (members: one, ever)
+// invite --cancel <code> cancel a live code
+static int cmd_invite(int argc, char **argv) {
+    if (require_auth() != 0) return 1;
+    int generate = 0;
+    const char *cancel = NULL;
+    for (int i = 0; i < argc; i++) {
+        if (!strcmp(argv[i], "--generate")) generate = 1;
+        else if (!strcmp(argv[i], "--cancel") && i + 1 < argc) cancel = argv[++i];
+    }
+    if (cancel) {
+        if (api_cancel_invite_code(cancel) != 0) { print_error(api_get_last_error()); return 1; }
+        if (g_json_enabled) printf("{\"cancelled\":true}\n"); else fprintf(stderr, "The code was cancelled.\n");
+        return 0;
+    }
+    if (generate) {
+        api_invites_t inv;
+        if (!g_json_enabled && api_get_my_invites(&inv) == 0 && !inv.unlimited) {
+            char answer[16];
+            if (read_line("You can only invite one person, so choose wisely! Make a code? [y/N] ", answer, sizeof(answer)) != 0
+                || (answer[0] != 'y' && answer[0] != 'Y')) return 1;
+        }
+        char code[32] = {0}, expires[32] = {0};
+        if (api_generate_invite_code(code, sizeof(code), expires, sizeof(expires)) != 0) { print_error(api_get_last_error()); return 1; }
+        if (g_json_enabled) printf("{\"code\":\"%s\",\"expiresAt\":\"%s\"}\n", code, expires);
+        else printf("Your invite code: %s%s%s\nValid until %s. It works once.\n", C_BOLD, code, C_RESET, when(expires, NULL));
+        return 0;
+    }
+    api_invites_t inv;
+    if (api_get_my_invites(&inv) != 0) { print_error(api_get_last_error()); return 1; }
+    if (g_json_enabled) {
+        printf("{\"unlimited\":%s,\"canGenerate\":%s,\"used\":%s,\"codes\":[", inv.unlimited ? "true" : "false",
+               inv.can_generate ? "true" : "false", inv.used ? "true" : "false");
+        for (int i = 0; i < inv.count; i++) printf("%s{\"code\":\"%s\",\"expiresAt\":\"%s\"}", i ? "," : "", inv.codes[i].code, inv.codes[i].expires_at);
+        printf("]}\n");
+        return 0;
+    }
+    if (inv.used && !inv.unlimited) printf("You've already used your invite.\n");
+    for (int i = 0; i < inv.count; i++)
+        printf("Live code: %s%s%s  (valid until %s)\n", C_BOLD, inv.codes[i].code, C_RESET, when(inv.codes[i].expires_at, NULL));
+    if (inv.can_generate)
+        printf("%s\nRun: simple-social-cli invite --generate\n",
+               inv.unlimited ? "As the owner you can make as many codes as you like." : "You can only invite one person, so choose wisely!");
+    return 0;
+}
+
+// devices                   every signed-in device
+// devices --revoke <id>     sign one out
+// devices --revoke-others   sign out everything but this one
+static int cmd_devices(int argc, char **argv) {
+    if (require_auth() != 0) return 1;
+    const char *revoke = NULL;
+    int others = 0;
+    for (int i = 0; i < argc; i++) {
+        if (!strcmp(argv[i], "--revoke") && i + 1 < argc) revoke = argv[++i];
+        else if (!strcmp(argv[i], "--revoke-others")) others = 1;
+    }
+    if (revoke) {
+        int was_current = 0;
+        if (api_revoke_session(revoke, &was_current) != 0) { print_error(api_get_last_error()); return 1; }
+        if (was_current) { ss_state_clear(&state); ss_state_delete_files(); }
+        if (g_json_enabled) printf("{\"revoked\":true,\"wasCurrent\":%s}\n", was_current ? "true" : "false");
+        else fprintf(stderr, was_current ? "Signed out (that was this device).\n" : "That device is signed out.\n");
+        return 0;
+    }
+    if (others) {
+        int n = 0;
+        if (api_revoke_all_other_sessions(&n) != 0) { print_error(api_get_last_error()); return 1; }
+        if (g_json_enabled) printf("{\"revoked\":%d}\n", n); else fprintf(stderr, "Signed out %d other device(s).\n", n);
+        return 0;
+    }
+    api_sessions_t ss;
+    if (api_get_sessions(&ss) != 0) { print_error(api_get_last_error()); return 1; }
+    if (g_json_enabled) {
+        printf("{\"sessions\":[");
+        for (int i = 0; i < ss.count; i++) {
+            api_session_t *d = &ss.sessions[i];
+            printf("%s{\"id\":\"%s\",\"deviceName\":\"%s\",\"createdAt\":\"%s\",\"createdTz\":%s%s%s,\"lastUsedAt\":\"%s\",\"isCurrent\":%s}",
+                   i ? "," : "", d->id, d->device_name, d->created_at, d->created_tz[0] ? "\"" : "", d->created_tz[0] ? d->created_tz : "null",
+                   d->created_tz[0] ? "\"" : "", d->last_used_at, d->is_current ? "true" : "false");
+        }
+        printf("],\"maxSessions\":%d}\n", ss.max_sessions);
+        return 0;
+    }
+    for (int i = 0; i < ss.count; i++) {
+        api_session_t *d = &ss.sessions[i];
+        printf("%s%-34s%s %s%s%s\n    signed in %s, last active %s\n", C_BOLD, d->device_name, C_RESET,
+               d->is_current ? C_GREEN : "", d->is_current ? "(this device)" : "", C_RESET,
+               when(d->created_at, d->created_tz), when(d->last_used_at, NULL));
+        printf("    %sid %s%s\n", C_DIM, d->id, C_RESET);
+    }
+    printf("%d of %d devices. Sign one out: simple-social-cli devices --revoke <id>\n", ss.count, ss.max_sessions);
+    return 0;
+}
+
 static void print_help(void) {
     fprintf(stderr, "Simple Social CLI\n\n");
     fprintf(stderr, "Usage: simple-social-cli <command> [args...]\n\n");
@@ -536,9 +904,14 @@ static void print_help(void) {
     fprintf(stderr, "  login <email> <password>           Login\n");
     fprintf(stderr, "  logout                             Logout\n");
     fprintf(stderr, "  whoami                             Show current user\n");
-    fprintf(stderr, "  register <email> <otp> <pw> <cfm>  Register\n");
-    fprintf(stderr, "  send-otp <email>                   Send registration OTP\n");
-    fprintf(stderr, "  reset-password <email> <otp> <pw> <cfm>  Reset password\n\n");
+    fprintf(stderr, "  register <invite code> <email> <pw> <cfm> [--otp CODE] [--agree]\n");
+    fprintf(stderr, "                                     Join with an invite code (asks for the\n");
+    fprintf(stderr, "                                     emailed code and the terms; --json needs\n");
+    fprintf(stderr, "                                     send-otp first, then --otp and --agree)\n");
+    fprintf(stderr, "  send-otp <email> [invite code]     Send the registration code\n");
+    fprintf(stderr, "  forgot-password <email>            Email a password reset code\n");
+    fprintf(stderr, "  reset-password <email> <otp> <pw> <cfm>  Reset password\n");
+    fprintf(stderr, "  accept-terms                       Accept the current Terms of Use\n\n");
     fprintf(stderr, "POSTS\n");
     fprintf(stderr, "  feed [--limit N] [--offset N]      Show feed\n");
     fprintf(stderr, "  posts [user_id] [--limit N] [--offset N]  List user posts\n");
@@ -549,8 +922,9 @@ static void print_help(void) {
     fprintf(stderr, "  unlike <post_id>                   Unlike post\n");
     fprintf(stderr, "  likes <post_id>                    List likes for post\n\n");
     fprintf(stderr, "COMMENTS\n");
-    fprintf(stderr, "  comments <post_id> [--offset N]    Show comments\n");
+    fprintf(stderr, "  comments <post_id> [--offset N] [--flat]  Show comments and replies\n");
     fprintf(stderr, "  comment <post_id> <text>           Add comment\n");
+    fprintf(stderr, "  reply <post_id> <comment_id> <text>  Reply to a comment\n");
     fprintf(stderr, "  delete-comment <comment_id>        Delete comment\n\n");
     fprintf(stderr, "USERS\n");
     fprintf(stderr, "  users                              List all users\n");
@@ -564,11 +938,21 @@ static void print_help(void) {
     fprintf(stderr, "  notify-count                       Unseen notification count\n");
     fprintf(stderr, "  mark-seen                          Mark notifications seen\n\n");
 
+    fprintf(stderr, "SAFETY\n");
+    fprintf(stderr, "  report post|comment|user <id> <reason> [details]\n");
+    fprintf(stderr, "                                     Reasons: spam, harassment, hate, sexual,\n");
+    fprintf(stderr, "                                     violence, self_harm, illegal, other\n");
+    fprintf(stderr, "  block <user_id> / unblock <user_id>  Block or unblock someone\n");
+    fprintf(stderr, "  blocked                            People you blocked\n\n");
     fprintf(stderr, "ACCOUNT\n");
+    fprintf(stderr, "  invite [--generate | --cancel <code>]  Your invite code\n");
+    fprintf(stderr, "  devices [--revoke <id> | --revoke-others]  Signed-in devices\n");
     fprintf(stderr, "  delete-account <password>          Delete your account\n\n");
+    fprintf(stderr, "Times are shown in UTC, with the creator's offset from GMT when known.\n\n");
     fprintf(stderr, "FLAGS\n");
     fprintf(stderr, "  --color          Colored output (auto if TTY)\n");
     fprintf(stderr, "  --json           Raw JSON output\n");
+    fprintf(stderr, "  --show-reported  Show what you reported instead of folding it\n");
     fprintf(stderr, "  --help           Show this help\n");
 }
 
@@ -585,6 +969,8 @@ static const command_t commands[] = {
     {"register",        4, cmd_register},
     {"send-otp",        1, cmd_send_otp},
     {"reset-password",  4, cmd_reset_password},
+    {"forgot-password", 1, cmd_forgot_password},
+    {"accept-terms",    0, cmd_accept_terms},
     {"feed",            0, cmd_feed},
     {"posts",           0, cmd_posts},
     {"post",            1, cmd_post},
@@ -606,6 +992,13 @@ static const command_t commands[] = {
     {"notify-count",    0, cmd_notify_count},
     {"mark-seen",       0, cmd_mark_seen},
     {"delete-account",  1, cmd_delete_account},
+    {"reply",           3, cmd_reply},
+    {"report",          3, cmd_report},
+    {"block",           1, cmd_block},
+    {"unblock",         1, cmd_unblock},
+    {"blocked",         0, cmd_blocked},
+    {"invite",          0, cmd_invite},
+    {"devices",         0, cmd_devices},
     {NULL, 0, NULL}
 };
 
@@ -623,6 +1016,7 @@ int main(int argc, char **argv) {
         if (strcmp(argv[next_arg], "--help") == 0) { print_help(); return 0; }
         else if (strcmp(argv[next_arg], "--color") == 0) g_color_enabled = 1;
         else if (strcmp(argv[next_arg], "--json") == 0) g_json_enabled = 1;
+        else if (strcmp(argv[next_arg], "--show-reported") == 0) g_show_reported = 1;
         else break;
         next_arg++;
     }
@@ -630,6 +1024,8 @@ int main(int argc, char **argv) {
         print_help();
         return 1;
     }
+    // --show-reported works anywhere on the line.
+    for (int i = 1; i < argc; i++) if (strcmp(argv[i], "--show-reported") == 0) g_show_reported = 1;
     if (g_json_enabled) g_color_enabled = 0;
     else if (g_color_enabled == 0 && isatty(STDERR_FILENO)) g_color_enabled = 1;
     output_init();
@@ -638,8 +1034,11 @@ int main(int argc, char **argv) {
     next_arg++;
 
     if (strcmp(cmd_name, "login") != 0 && strcmp(cmd_name, "register") != 0 &&
-        strcmp(cmd_name, "send-otp") != 0 && strcmp(cmd_name, "reset-password") != 0) {
+        strcmp(cmd_name, "send-otp") != 0 && strcmp(cmd_name, "reset-password") != 0 &&
+        strcmp(cmd_name, "forgot-password") != 0) {
         auto_login();
+        show_welcome_once();
+        if (strcmp(cmd_name, "accept-terms") != 0) terms_notice();
     }
 
     for (int i = 0; commands[i].name; i++) {

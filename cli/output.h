@@ -5,6 +5,7 @@
 
 extern int g_color_enabled;
 extern int g_json_enabled;
+extern int g_show_reported;   // --show-reported: unfold what you reported
 extern const char *C_RESET;
 extern const char *C_BOLD;
 extern const char *C_CYAN;
@@ -22,7 +23,8 @@ void print_user_info(int id, const char *email, const char *created_at);
 void print_comments(const api_comments_result_t *result);
 void print_notifications(const api_notifications_result_t *result);
 void print_profile(int user_id, const char *email, const char *created_at,
-                   int follower_count, int following_count);
+                   int follower_count, int following_count, const char *role);
+const char *role_label(const char *role);
 void print_success(const char *msg);
 void print_error(const char *msg);
 void print_json_error(const char *msg);
