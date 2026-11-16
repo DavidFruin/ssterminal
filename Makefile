@@ -76,7 +76,7 @@ tui/src/%.o: tui/src/%.c
 	$(CC) $(CFLAGS) -Ilib $(NCURSES_CFLAGS) -c -o $@ $<
 
 clean:
-	rm -f $(ALL_OBJS) $(ALL_OBJS:.o=.d) $(LIB) $(CLI_BIN) $(WIZ_BIN) $(TUI_BIN)
+	rm -f $(ALL_OBJS) $(ALL_OBJS:.o=.d) $(LIB) $(CLI_BIN) $(WIZ_BIN) $(TUI_BIN) tests/test_json tests/test_json.d
 
 # Short PATH names are unchanged from the three old repos.
 install-cli: $(CLI_BIN)
@@ -90,6 +90,13 @@ install: install-cli install-wizard install-tui
 uninstall:
 	rm -f $(DESTDIR)$(PREFIX)/bin/sscli $(DESTDIR)$(PREFIX)/bin/sswiz $(DESTDIR)$(PREFIX)/bin/sstui
 
+# Unit tests that need no server: the JSON reader.
+tests/test_json: tests/test_json.c $(LIB)
+	$(CC) $(CFLAGS) -Ilib -o $@ tests/test_json.c $(LIB) $(CURL_LIBS)
+
+unit: tests/test_json
+	./tests/test_json
+
 # Needs TEST_EMAIL / TEST_PASSWORD (and TEST_BASE_URL; the default is dev).
 test: $(CLI_BIN) $(WIZ_BIN)
 	./tests/test_cli.sh
@@ -97,4 +104,4 @@ test: $(CLI_BIN) $(WIZ_BIN)
 
 -include $(ALL_OBJS:.o=.d)
 
-.PHONY: all cli wizard tui clean install install-cli install-wizard install-tui uninstall test
+.PHONY: all unit cli wizard tui clean install install-cli install-wizard install-tui uninstall test

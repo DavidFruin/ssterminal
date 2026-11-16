@@ -10,3 +10,4 @@ core
 simple-social-cli
 simple-social-cli-interactive
 simple-social-tui
+tests/test_json
