@@ -8,12 +8,23 @@
 #include "ss_api.h"
 #include "ss_config.h"
 #include "ss_state.h"
+#include <time.h>
+#include "timefmt.h"
 
 static const char *ACTION_LABEL[SETTINGS_ACTIONS] = {
+    "Invite someone",
+    "Blocked people",
+    "Devices",
+    "Terms of Use",
     "Change password",
     "Log out",
     "Delete account"
 };
+#define ACTION_DELETE (SETTINGS_ACTIONS - 1)
+
+/* Media storage used, read when the tab is drawn at most once a minute. */
+static long long g_used = -1, g_limit = 0;
+static time_t g_storage_at = 0;
 
 void settings_move(app_t *app, int delta) {
     app->settings_sel += delta;
@@ -32,6 +43,13 @@ void settings_draw(app_t *app, int body_top) {
     attron(A_DIM);
     mvprintw(row++, 3, "%s  (id %d)", app->state.user.email, app->state.user.user_id);
     mvprintw(row++, 3, "token in ~/.simple-social-cli/tui/ (this tool only)");
+    if (time(NULL) - g_storage_at > 60) {
+        api_media_limits_t lim;
+        g_storage_at = time(NULL);
+        if (api_get_media_limits(&lim) == 0) { g_used = lim.storage_used; g_limit = lim.storage_limit; }
+    }
+    if (g_used >= 0 && g_limit > 0)
+        mvprintw(row++, 3, "media      %.1f MB of %.0f MB used", g_used / 1048576.0, g_limit / 1048576.0);
     attroff(A_DIM);
     row++;
 
@@ -58,7 +76,7 @@ void settings_draw(app_t *app, int body_top) {
 
     for (int i = 0; i < SETTINGS_ACTIONS && row <= bottom; i++, row++) {
         int selected = (i == app->settings_sel);
-        int danger = (i == 2);
+        int danger = (i == ACTION_DELETE);
 
         if (selected) { attron(COLOR_PAIR(CP_TAB_ACTIVE) | A_BOLD); mvhline(row, 0, ' ', COLS); }
         else if (danger) attron(COLOR_PAIR(CP_ERROR));
@@ -215,11 +233,82 @@ static void delete_account(app_t *app) {
     app->account_deleted = 1;
 }
 
+static void blocked_people(app_t *app) {
+    static api_users_result_t res;
+    if (api_get_blocked_users(&res) != 0) { app_set_error(app, "%s", api_get_last_error()); ui_modal_error(app, app->status); return; }
+    if (res.count == 0) { ui_message(app, "Blocked people", "You haven't blocked anyone."); return; }
+    const char *opts[64];
+    int n = res.count < 64 ? res.count : 64;
+    for (int i = 0; i < n; i++) opts[i] = res.users[i].email;
+    int pick = ui_choose(app, "Blocked people (enter: unblock)", opts, n);
+    if (pick < 0) return;
+    char q[320];
+    snprintf(q, sizeof(q), "Unblock %.250s?", res.users[pick].email);
+    if (!ui_confirm(app, q, 0)) return;
+    if (api_unblock_user(res.users[pick].id) != 0) { app_set_error(app, "%s", api_get_last_error()); ui_modal_error(app, app->status); return; }
+    app->feed.fetched = 0;
+    app->users_fetched = 0;
+    app_set_status(app, "Unblocked %s.", res.users[pick].email);
+}
+
+static void devices(app_t *app) {
+    api_sessions_t ss;
+    if (api_get_sessions(&ss) != 0) { app_set_error(app, "%s", api_get_last_error()); ui_modal_error(app, app->status); return; }
+    static char labels[33][200];
+    const char *opts[33];
+    int n = 0;
+    for (int i = 0; i < ss.count && n < 32; i++, n++) {
+        char last[64];
+        timefmt_full(ss.sessions[i].last_used_at, last, sizeof(last));
+        snprintf(labels[n], sizeof(labels[n]), "%.90s%s  last active %s", ss.sessions[i].device_name,
+                 ss.sessions[i].is_current ? " (this device)" : "", last);
+        opts[n] = labels[n];
+    }
+    snprintf(labels[n], sizeof(labels[n]), "Sign out all other devices");
+    opts[n] = labels[n];
+    int pick = ui_choose(app, "Devices (enter: sign out)", opts, n + 1);
+    if (pick < 0) return;
+    if (pick == n) {
+        int count = 0;
+        if (!ui_confirm(app, "Sign out every other device?", 0)) return;
+        if (api_revoke_all_other_sessions(&count) != 0) { app_set_error(app, "%s", api_get_last_error()); ui_modal_error(app, app->status); return; }
+        app_set_status(app, "Signed out %d other device(s).", count);
+        return;
+    }
+    if (!ui_confirm(app, ss.sessions[pick].is_current ? "Sign out this device? (This logs you out here.)" : "Sign out that device?", 0)) return;
+    int was_current = 0;
+    if (api_revoke_session(ss.sessions[pick].id, &was_current) != 0) { app_set_error(app, "%s", api_get_last_error()); ui_modal_error(app, app->status); return; }
+    if (was_current) {
+        app_clear_session_files();
+        ss_state_clear(&app->state);
+        api_set_jwt("");
+        app->logged_out = 1;
+        return;
+    }
+    app_set_status(app, "That device is signed out.");
+}
+
+static void terms(app_t *app) {
+    api_me_t me;
+    if (api_get_me(&me) != 0) { app_set_error(app, "%s", api_get_last_error()); ui_modal_error(app, app->status); return; }
+    char msg[512];
+    snprintf(msg, sizeof(msg), "Read the Terms of Use at %s\n\nYou have accepted version %d; the current one is %d.",
+             me.terms_url, me.terms_accepted, me.terms_current);
+    ui_message(app, "Terms of Use", msg);
+}
+
+/* Invite lives on the Me tab (i); this runs the same thing from here. */
+void app_invite(app_t *app);
+
 void settings_activate(app_t *app) {
     switch (app->settings_sel) {
-        case 0: change_password(app); break;
-        case 1: do_logout(app);       break;
-        case 2: delete_account(app);  break;
+        case 0: app_invite(app);       break;
+        case 1: blocked_people(app);   break;
+        case 2: devices(app);          break;
+        case 3: terms(app);            break;
+        case 4: change_password(app);  break;
+        case 5: do_logout(app);        break;
+        case 6: delete_account(app);   break;
         default: break;
     }
 }

@@ -6,8 +6,9 @@
 
 #define RELATIVE_CUTOFF (24 * 60 * 60)
 
-/* Parsed as local time, which is what the server's timestamps have matched
- * so far. If that ever drifts, this is the one place to fix it. */
+/* The server's times are UTC ("2026-04-13 22:17:00"). Every absolute time
+ * is shown in UTC and says so; only the "how long ago" form is zone-free. */
+
 /* The follows/followers endpoints return the literal string "Unknown"
  * for relationships that predate the server tracking timestamps. */
 static int is_unknown(const char *ts) {
@@ -19,8 +20,7 @@ static int parse_ts(const char *ts, time_t *out) {
     struct tm tm;
     memset(&tm, 0, sizeof(tm));
     if (!strptime(ts, "%Y-%m-%d %H:%M:%S", &tm)) return -1;
-    tm.tm_isdst = -1;
-    time_t t = mktime(&tm);
+    time_t t = timegm(&tm);
     if (t == (time_t)-1) return -1;
     *out = t;
     return 0;
@@ -44,9 +44,9 @@ void timefmt_short(const char *ts, char *out, size_t n) {
         else if (secs < 3600) snprintf(out, n, "%dm", secs / 60);
         else                  snprintf(out, n, "%dh", secs / 3600);
     } else {
-        struct tm lt;
-        localtime_r(&t, &lt);
-        strftime(out, n, "%Y-%m-%d", &lt);
+        struct tm ut;
+        gmtime_r(&t, &ut);
+        strftime(out, n, "UTC %Y-%m-%d", &ut);
     }
 }
 
@@ -58,7 +58,14 @@ void timefmt_full(const char *ts, char *out, size_t n) {
         snprintf(out, n, "%s", ts);
         return;
     }
-    struct tm lt;
-    localtime_r(&t, &lt);
-    strftime(out, n, "%Y-%m-%d %H:%M", &lt);
+    struct tm ut;
+    gmtime_r(&t, &ut);
+    strftime(out, n, "UTC %Y-%m-%d %H:%M", &ut);
+}
+
+void timefmt_full_tz(const char *ts, const char *tz, char *out, size_t n) {
+    char base[48];
+    timefmt_full(ts, base, sizeof(base));
+    if (tz && tz[0] && !is_unknown(ts)) snprintf(out, n, "%s (GMT%s)", base, tz);
+    else snprintf(out, n, "%s", base);
 }

@@ -6,6 +6,7 @@
 #include "ui.h"
 #include "timefmt.h"
 #include "shell.h"
+#include "net.h"
 
 /* The detail view is rendered into a flat list of lines, then scrolled by
  * line. Post text and comments both wrap to arbitrary heights, and
@@ -131,50 +132,72 @@ static void build_lines(app_t *app) {
     if (width < 16) width = 16;
 
     api_post_t *p = &app->detail;
+    int folded = p->reported_by_me && !app->detail_show_reported;
 
-    char when[64];
-    timefmt_full(p->timestamp, when, sizeof(when));
+    char when[80];
+    timefmt_full_tz(p->timestamp, p->timestamp_tz, when, sizeof(when));
     line_add(DL_AUTHOR, -1, "%s", p->user_email);
     line_add(DL_META,   -1, "%s", when);
     line_add(DL_PLAIN,  -1, "");
 
-    line_add_wrapped(DL_PLAIN, -1, p->text, width, 0);
+    if (p->frozen)
+        line_add(DL_SECTION, -1, "Hidden by a moderator. Only you can see this post.");
+    if (folded) {
+        line_add(DL_META, -1, "You reported this post. Press s to see it.");
+    } else {
+        line_add_wrapped(DL_PLAIN, -1, p->text, width, 0);
+    }
     line_add(DL_PLAIN, -1, "");
 
-    line_add(DL_META, -1, "%s %d   comments %d",
-             "\xe2\x99\xa5", p->like_count, app->comments.total_count);
+    if (!p->frozen)
+        line_add(DL_META, -1, "%s %d   comments %d",
+                 "\xe2\x99\xa5", p->like_count, p->comment_count);
 
-    if (p->media_url[0]) {
+    if (p->media_url[0] && !folded) {
         char url[1024];
+        const char *kind = p->media_loop ? "GIF (plays as a loop)" : (p->media_type[0] ? p->media_type : "media");
         if (shell_media_url(p->media_url, url, sizeof(url)) == 0)
-            line_add(DL_MEDIA, -1, "media: %s", url);
+            line_add(DL_MEDIA, -1, "%s: %s", kind, url);
         else
-            line_add(DL_MEDIA, -1, "media: %s", p->media_url);
+            line_add(DL_MEDIA, -1, "%s: %s", kind, p->media_url);
     }
 
     line_add(DL_RULE, -1, "");
 
     if (app->comments.count == 0) {
-        line_add(DL_SECTION, -1, "No comments yet.");
+        line_add(DL_SECTION, -1, p->frozen ? "Comments are hidden while the post is." : "No comments yet.");
     } else {
-        line_add(DL_SECTION, -1, "Comments (%d of %d)",
-                 app->comments.count, app->comments.total_count);
+        line_add(DL_SECTION, -1, "Comments");
         line_add(DL_PLAIN, -1, "");
 
         for (int i = 0; i < app->comments.count; i++) {
             api_comment_t *c = &app->comments.comments[i];
             remember_cfirst(app, i, g_count);
+            /* Replies sit indented under the comment they answer. */
+            int indent = c->parent_id ? 4 : 0;
+            const char *arrow = c->parent_id ? "\xe2\x86\xb3 " : "";
 
-            char cwhen[64];
-            timefmt_short(c->created_at, cwhen, sizeof(cwhen));
-            line_add(DL_CAUTHOR, i, "%s  %s", c->user_email, cwhen);
-            line_add_wrapped(DL_PLAIN, i, c->text, width, 2);
+            if (c->deleted || c->frozen_by_staff) {
+                line_add(DL_META, i, "%*s%s%s", indent, "", arrow,
+                         c->deleted ? "Comment deleted" : "Comment frozen by staff");
+                line_add(DL_PLAIN, i, "");
+                continue;
+            }
+
+            char cwhen[80];
+            timefmt_full_tz(c->created_at, c->created_tz, cwhen, sizeof(cwhen));
+            line_add(DL_CAUTHOR, i, "%*s%s%s  %s", indent, "", arrow, c->user_email, cwhen);
+            if (c->reported_by_me && !app->detail_show_reported)
+                line_add(DL_META, i, "%*sYou reported this comment. Press s to see it.", indent + 2, "");
+            else if (c->frozen) {
+                line_add(DL_META, i, "%*s[Hidden by a moderator]", indent + 2, "");
+                line_add_wrapped(DL_PLAIN, i, c->text, width, indent + 2);
+            } else
+                line_add_wrapped(DL_PLAIN, i, c->text, width, indent + 2);
             line_add(DL_PLAIN, i, "");
         }
-
         if (app->comments.has_more)
-            line_add(DL_MORE, -1, "-- load more comments (%d of %d) --",
-                     app->comments.count, app->comments.total_count);
+            line_add(DL_MORE, -1, "-- load more comments --");
     }
 }
 

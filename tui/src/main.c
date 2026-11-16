@@ -82,6 +82,9 @@ int main(void) {
         return 1;
     }
 
+    /* A saved session: the same welcome/terms checks as a fresh login. */
+    if (ss_state_is_logged_in(&app.state)) auth_after_login(&app);
+
     /* Log in, use the app, and come back here if they log out again. */
     for (;;) {
         if (!ss_state_is_logged_in(&app.state)) {

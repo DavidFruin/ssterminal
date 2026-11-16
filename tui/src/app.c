@@ -5,6 +5,8 @@
 #include <ncurses.h>
 #include "app.h"
 #include "ui.h"
+#include "timefmt.h"
+#include "ss_api.h"
 #include "net.h"
 #include "ss_api.h"
 #include "detail.h"
@@ -305,9 +307,11 @@ static void open_notif_target(app_t *app) {
 
     api_notification_t *n = &app->notifs.notifs[app->notif_sel];
     if (!n->post_id[0]) {
-        app_set_status(app, "That one is about a follow, not a post.");
+        /* A follow: open the person instead. */
+        if (n->actor_id > 0) open_profile(app, n->actor_id);
         return;
     }
+    app->pending_comment_id = n->comment_id;   /* a reply or comment: select it */
 
     /* -1: this did not come from the feed, so there is no row to keep in step. */
     app_push(app, VIEW_POST);
@@ -324,10 +328,12 @@ static void close_post(app_t *app) {
 /* Collects text either inline or from $EDITOR, per the config. Returns 1
  * if there is something to send. */
 static int compose_text(app_t *app, const char *title, const char *send_label,
-                        char *out, size_t outsz, char *attach, size_t attach_sz) {
+                        char *out, size_t outsz, char *attach, size_t attach_sz,
+                        const char *initial) {
+    if (!initial) initial = "";
     if (app->cfg.compose_mode == CFG_COMPOSE_EXTERNAL) {
         app->input_active = 1;
-        int rc = shell_edit_text("", out, outsz);
+        int rc = shell_edit_text(initial, out, outsz);
         app->input_active = 0;
 
         if (rc < 0) {
@@ -348,7 +354,7 @@ static int compose_text(app_t *app, const char *title, const char *send_label,
     }
 
     editor_t ed;
-    if (editor_init(&ed, "", 5000) != 0) {
+    if (editor_init(&ed, initial, 5000) != 0) {
         app_set_error(app, "out of memory");
         return 0;
     }
@@ -365,19 +371,134 @@ static int compose_text(app_t *app, const char *title, const char *send_label,
     return 1;
 }
 
+/* A text the server refused (a word that isn't allowed, characters it
+ * doesn't take, too long: all 400s) goes back into the editor so it can be
+ * fixed instead of retyped. */
+static int refused_text(void) { return api_get_last_status() == 400; }
+
 static void compose_post(app_t *app) {
-    char text[5200];
+    char text[5200] = {0};
     char attach[1024] = {0};
-    if (!compose_text(app, "New post", "post", text, sizeof(text), attach, sizeof(attach)))
-        return;
-    report(app, net_create_post(app, text, attach));
+    for (;;) {
+        char initial[5200];
+        snprintf(initial, sizeof(initial), "%s", text);
+        if (!compose_text(app, "New post", "post", text, sizeof(text), attach, sizeof(attach), initial))
+            return;
+        if (net_create_post(app, text, attach) == 0) return;
+        if (!refused_text()) { report(app, -1); return; }
+        ui_modal_error(app, app->status);
+    }
 }
 
-/* Media only attaches to posts: api_create_comment takes no media. */
+/* Media only attaches to posts: comments and replies take none.
+ * parent_id 0 = a comment on the post; otherwise a reply under it. */
+static void compose_reply(app_t *app, int parent_id, const char *title) {
+    char text[5200] = {0};
+    for (;;) {
+        char initial[5200];
+        snprintf(initial, sizeof(initial), "%s", text);
+        if (!compose_text(app, title, parent_id ? "reply" : "comment", text, sizeof(text), NULL, 0, initial)) return;
+        if (net_create_reply(app, parent_id, text) == 0) return;
+        if (!refused_text()) { report(app, -1); return; }
+        ui_modal_error(app, app->status);
+    }
+}
+
 static void compose_comment(app_t *app) {
-    char text[5200];
-    if (!compose_text(app, "New comment", "comment", text, sizeof(text), NULL, 0)) return;
-    report(app, net_create_comment(app, text));
+    if (app->detail.frozen) { app_set_status(app, "This post is hidden by a moderator."); return; }
+    compose_reply(app, 0, "New comment");
+}
+
+/* r on a comment: replies go under the top-level comment of the thread. */
+static void reply_to_selected(app_t *app) {
+    if (app->comments.count == 0 || app->detail_on_more) { app_set_status(app, "Select a comment to reply to."); return; }
+    api_comment_t *c = &app->comments.comments[app->comment_sel];
+    int parent = c->parent_id ? c->parent_id : c->id;
+    api_comment_t *top = c;
+    for (int i = 0; i < app->comments.count; i++) if (app->comments.comments[i].id == parent) top = &app->comments.comments[i];
+    if (top->deleted || top->frozen_by_staff) { app_set_status(app, "That thread can't take new replies."); return; }
+    char title[300];
+    snprintf(title, sizeof(title), "Reply to %.200s", top->user_email);
+    compose_reply(app, parent, title);
+}
+
+/* Reason menu, then a confirmation, then the report. */
+static void report_item(app_t *app, const char *type, const char *id, const char *what) {
+    static const char *const labels[] = {
+        "Spam", "Harassment or bullying", "Hate", "Sexual content", "Violence",
+        "Self-harm", "Illegal", "Something else"
+    };
+    int pick = ui_choose(app, "Why are you reporting it?", labels, 8);
+    if (pick < 0) { app_set_status(app, "Not reported."); return; }
+    char q[256];
+    snprintf(q, sizeof(q), "Report %s to the moderators for: %s?", what, labels[pick]);
+    if (!ui_confirm(app, q, 0)) { app_set_status(app, "Not reported."); return; }
+    report(app, net_report(app, type, id, api_report_reasons[pick]));
+}
+
+static void report_in_post(app_t *app) {
+    int has_comment = app->comments.count > 0 && !app->detail_on_more;
+    api_comment_t *c = has_comment ? &app->comments.comments[app->comment_sel] : NULL;
+    if (c && (c->deleted || c->frozen_by_staff || c->user_id == app->state.user.user_id)) c = NULL;
+    int own_post = app->detail.user_id == app->state.user.user_id;
+    if (own_post && !c) { app_set_status(app, "There is nothing here you can report."); return; }
+
+    int choice = 0;
+    if (c && !own_post) {
+        static const char *const opts[] = {"The post", "The selected comment"};
+        choice = ui_choose(app, "Report what?", opts, 2);
+        if (choice < 0) return;
+    } else if (c) {
+        choice = 1;
+    }
+    if (choice == 0) {
+        report_item(app, "post", app->detail.id, "this post");
+    } else {
+        char id[16];
+        snprintf(id, sizeof(id), "%d", c->id);
+        report_item(app, "comment", id, "this comment");
+    }
+}
+
+static void invite_flow(app_t *app);
+/* i on the Me tab: the member's one invite (the owner: as many as they like). */
+void app_invite(app_t *app);
+void app_invite(app_t *app) { invite_flow(app); }
+static void invite_flow(app_t *app) {
+    api_invites_t inv;
+    if (api_get_my_invites(&inv) != 0) { app_set_error(app, "%s", api_get_last_error()); report(app, -1); return; }
+    char msg[1024];
+    size_t len = 0;
+    char exp[64];
+    for (int i = 0; i < inv.count && len < sizeof(msg) - 120; i++) {
+        timefmt_full(inv.codes[i].expires_at, exp, sizeof(exp));
+        len += snprintf(msg + len, sizeof(msg) - len, "Your code: %s  (valid until %s)\n", inv.codes[i].code, exp);
+    }
+    if (inv.count && !inv.unlimited) {
+        snprintf(msg + len, sizeof(msg) - len, "Give it to the one person you want to invite.");
+        ui_message(app, "Invite someone", msg);
+        if (ui_confirm(app, "Cancel this code instead?", 0)) {
+            if (api_cancel_invite_code(inv.codes[0].code) != 0) { app_set_error(app, "%s", api_get_last_error()); report(app, -1); }
+            else app_set_status(app, "The code was cancelled.");
+        }
+        return;
+    }
+    if (!inv.can_generate) {
+        ui_message(app, "Invite someone", "You've already used your invite.");
+        return;
+    }
+    if (!ui_confirm(app, inv.unlimited ? "Make a new invite code? (As the owner you can make as many as you like.)"
+                                       : "You can only invite one person, so choose wisely! Make your invite code now?", 0))
+        return;
+    char code[32] = {0}, expires[32] = {0};
+    if (api_generate_invite_code(code, sizeof(code), expires, sizeof(expires)) != 0) {
+        app_set_error(app, "%s", api_get_last_error());
+        report(app, -1);
+        return;
+    }
+    timefmt_full(expires, exp, sizeof(exp));
+    snprintf(msg, sizeof(msg), "Your invite code: %s\nValid until %s. It works once.\nSelect it with the mouse to copy it.", code, exp);
+    ui_message(app, "Invite someone", msg);
 }
 
 static int is_mine(app_t *app, int user_id) {
@@ -552,6 +673,21 @@ void app_run(app_t *app) {
                 case 'W': open_user_list(app, LIST_FOLLOWERS); continue;
 
                 case 'r': report(app, net_open_profile(app, app->profile_id)); continue;
+                case 'R':
+                    if (app->profile_id == app->state.user.user_id) { app_set_status(app, "That's you."); continue; }
+                    {
+                        char id[16];
+                        snprintf(id, sizeof(id), "%d", app->profile_id);
+                        report_item(app, "user", id, "this person");
+                    }
+                    continue;
+                case 'B':
+                    if (app->profile_id == app->state.user.user_id) { app_set_status(app, "That's you."); continue; }
+                    if (ui_confirm(app, "Block this person? Neither of you will see the other's posts, comments or profile.", 1)
+                        && net_block(app, app->profile_id) == 0)
+                        app_pop(app);
+                    else report(app, app->status_is_error ? -1 : 0);
+                    continue;
                 case '?': ui_help(app); continue;
                 default:  continue;
             }
@@ -625,6 +761,18 @@ void app_run(app_t *app) {
 
                 case 'c':
                     compose_comment(app);
+                    continue;
+
+                case 'r':
+                    reply_to_selected(app);
+                    continue;
+
+                case 's':
+                    app->detail_show_reported = !app->detail_show_reported;
+                    continue;
+
+                case 'R':
+                    report_in_post(app);
                     continue;
 
                 case 'd':
@@ -765,6 +913,9 @@ void app_run(app_t *app) {
 
             case 'w':
                 if (app->tab == TAB_ME) open_user_list(app, LIST_FOLLOWS);
+                break;
+            case 'i':
+                if (app->tab == TAB_ME) invite_flow(app);
                 break;
             case 'W':
                 if (app->tab == TAB_ME) open_user_list(app, LIST_FOLLOWERS);

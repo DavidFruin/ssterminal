@@ -7,7 +7,7 @@
  * account operations. Destructive ones live here rather than at top level
  * so they are reachable but not somewhere you land by accident. */
 
-#define SETTINGS_ACTIONS 3
+#define SETTINGS_ACTIONS 7
 
 void settings_draw(app_t *app, int body_top);
 void settings_move(app_t *app, int delta);

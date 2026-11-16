@@ -26,6 +26,8 @@ int net_toggle_like(app_t *app);
 /* Writes */
 int net_create_post(app_t *app, const char *text, const char *media_path);
 int net_create_comment(app_t *app, const char *text);
+/* A reply under the top-level comment parent_id (0 = a new comment). */
+int net_create_reply(app_t *app, int parent_id, const char *text);
 int net_delete_post(app_t *app, const char *post_id);
 int net_delete_comment(app_t *app, int comment_id);
 int net_reload_comments(app_t *app);
@@ -40,5 +42,9 @@ int net_open_profile(app_t *app, int user_id);
 int net_load_more_profile_posts(app_t *app);
 int net_toggle_follow(app_t *app);
 int net_open_user_list(app_t *app, int owner_id, list_kind_t kind);
+
+/* Report (type: post | comment | user) and block. */
+int net_report(app_t *app, const char *type, const char *id, const char *reason);
+int net_block(app_t *app, int user_id);
 
 #endif

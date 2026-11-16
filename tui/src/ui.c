@@ -267,10 +267,10 @@ static void draw_tabs(app_t *app) {
 
 static const char *hints_for(app_t *app) {
     if (app->view == VIEW_POST)
-        return "j/k:comments  c:comment  l:like  o:media  d/D:del  tab:tabs  esc:back  ?:help";
+        return "j/k:comments  c:comment  r:reply  l:like  o:media  s:show  R:report  d/D:del  esc:back  ?:help";
 
     if (app->view == VIEW_PROFILE)
-        return "j/k:posts  enter:open  f:follow  w/W:follows  esc:back  ?:help";
+        return "j/k:posts  enter:open  f:follow  w/W:follows  R:report  B:block  esc:back  ?:help";
 
     if (app->view == VIEW_USERLIST)
         return "j/k:move  enter:profile  esc:back  ?:help  q:quit";
@@ -283,7 +283,7 @@ static const char *hints_for(app_t *app) {
         case TAB_USERS:
             return "j/k:move  enter:profile  r:refresh  1-5:tabs  ?:help  q:quit";
         case TAB_ME:
-            return "j/k:posts  enter:open  w/W:follows  r:refresh  ?:help  q:quit";
+            return "j/k:posts  enter:open  w/W:follows  i:invite  r:refresh  ?:help  q:quit";
         case TAB_SETTINGS:
             return "j/k:move  enter:choose  1-5:tabs  ?:help  q:quit";
         default:
@@ -414,7 +414,13 @@ static int draw_post_card(post_list_t *pl, int row, int idx, int bottom) {
     if (body_w < 8) body_w = 8;
 
     static char lines[MAX_WRAP][512];
-    int n = wrap_text(p->text, body_w, lines, MAX_WRAP);
+    /* Reported by you: one folded line (open the post and press s to see
+     * it). Hidden by staff: only ever your own post, and labelled. */
+    char shown[5200];
+    if (p->reported_by_me) snprintf(shown, sizeof(shown), "You reported this post.");
+    else if (p->frozen) snprintf(shown, sizeof(shown), "[Hidden by a moderator] %s", p->text);
+    else snprintf(shown, sizeof(shown), "%s", p->text);
+    int n = wrap_text(shown, body_w, lines, MAX_WRAP);
 
     int h = 4 + n;   /* top border, header, n body lines, meta, bottom border */
     if (row + h - 1 > bottom) h = bottom - row + 1;
@@ -436,8 +442,8 @@ static int draw_post_card(post_list_t *pl, int row, int idx, int bottom) {
         for (int fr = row + 1; fr < last; fr++) mvhline(fr, 1, ' ', COLS - 2);
     }
 
-    char when[32];
-    timefmt_full(p->timestamp, when, sizeof(when));
+    char when[64];
+    timefmt_full_tz(p->timestamp, p->timestamp_tz, when, sizeof(when));
     int when_w = ui_utf8_width(when);
 
     char author[128];
@@ -460,25 +466,27 @@ static int draw_post_card(post_list_t *pl, int row, int idx, int bottom) {
 
     /* Body, with @[id] mentions highlighted -- except on the fill, where
      * every foreground color but the fill's own would be unreadable. */
+    if (p->reported_by_me && !selected) attron(A_DIM);
     for (int i = 0; i < n && r < last; i++, r++)
-        draw_text_line(r, 3, lines[i], selected);
+        draw_text_line(r, 3, lines[i], selected || p->reported_by_me);
+    if (p->reported_by_me && !selected) attroff(A_DIM);
 
     /* Meta */
     if (r < last) {
         char meta[256];
-        snprintf(meta, sizeof(meta), "%s %d", "\xe2\x99\xa5", p->like_count);
+        snprintf(meta, sizeof(meta), "%s %d   comments %d", "\xe2\x99\xa5", p->like_count, p->comment_count);
         if (p->is_liked && !selected) attron(COLOR_PAIR(CP_LIKED) | A_BOLD);
         mvaddstr(r, 3, meta);
         if (p->is_liked && !selected) attroff(COLOR_PAIR(CP_LIKED) | A_BOLD);
 
-        if (p->media_url[0]) {
+        if (p->media_url[0] && !p->reported_by_me) {
             int x = 3 + ui_utf8_width(meta) + 3;
             int budget = (COLS - 2) - x - 7;   /* 7 = "media: " */
             if (budget > 4) {
                 char murl[512];
                 ui_utf8_take(murl, sizeof(murl), p->media_url, budget, 1);
                 if (!selected) attron(A_DIM);
-                mvprintw(r, x, "media: %s", murl);
+                mvprintw(r, x, "%s: %s", p->media_loop ? "GIF (loops)" : (p->media_type[0] ? p->media_type : "media"), murl);
                 if (!selected) attroff(A_DIM);
             }
         }
@@ -530,14 +538,17 @@ static void draw_feed(app_t *app) {
                       "end of feed");
 }
 
-/* The five types api.php writes. */
+/* Every type api.php writes; anything newer still gets a line. */
 static const char *notif_phrase(const char *type) {
-    if (strcmp(type, "like") == 0)     return "liked your post";
-    if (strcmp(type, "unlike") == 0)   return "unliked your post";
-    if (strcmp(type, "comment") == 0)  return "commented on your post";
-    if (strcmp(type, "follow") == 0)   return "followed you";
-    if (strcmp(type, "unfollow") == 0) return "unfollowed you";
-    return type;
+    if (strcmp(type, "like") == 0)         return "liked your post";
+    if (strcmp(type, "unlike") == 0)       return "unliked your post";
+    if (strcmp(type, "comment") == 0)      return "commented on your post";
+    if (strcmp(type, "reply") == 0)        return "replied to your comment";
+    if (strcmp(type, "thread_reply") == 0) return "also replied in a thread you replied in";
+    if (strcmp(type, "follow") == 0)       return "followed you";
+    if (strcmp(type, "unfollow") == 0)     return "unfollowed you";
+    if (strcmp(type, "mention") == 0)      return "mentioned you";
+    return "did something";
 }
 
 static void draw_notifs(app_t *app) {
@@ -718,6 +729,18 @@ static void draw_profile(app_t *app) {
     attron(COLOR_PAIR(CP_AUTHOR) | A_BOLD);
     mvaddstr(row, 1, email);
     attroff(COLOR_PAIR(CP_AUTHOR) | A_BOLD);
+    {
+        /* The public role badge, as on every profile on the website. */
+        const char *r = app->profile_role;
+        const char *label = !strcmp(r, "owner") ? "Owner" : !strcmp(r, "admin") ? "Admin"
+                          : !strcmp(r, "moderator") ? "Moderator" : "User";
+        int x = 2 + ui_utf8_width(email) + 1;
+        if (x + 12 < COLS) {
+            attron(COLOR_PAIR(CP_BADGE) | A_BOLD);
+            mvprintw(row, x, "[%s]", label);
+            attroff(COLOR_PAIR(CP_BADGE) | A_BOLD);
+        }
+    }
     row++;
 
     char joined[64];
@@ -865,6 +888,110 @@ void ui_modal_error(app_t *app, const char *msg) {
     doupdate();   /* nothing else follows -- the modal is closing */
 }
 
+void ui_message(app_t *app, const char *title, const char *msg) {
+    static char lines[MAX_WRAP][512];
+
+    int w = COLS - 8;
+    if (w > 70) w = 70;
+    if (w < 24) w = COLS > 24 ? 24 : COLS;
+
+    int n = wrap_text(msg ? msg : "", w - 4, lines, MAX_WRAP);
+    int h = n + 4;
+    if (h > LINES - 2) h = LINES - 2;
+
+    int top = (LINES - h) / 2, left = (COLS - w) / 2;
+    if (top < 0) top = 0;
+    if (left < 0) left = 0;
+
+    WINDOW *win = newwin(h, w, top, left);
+    if (!win) return;
+
+    wattron(win, COLOR_PAIR(CP_PRIMARY));
+    box(win, 0, 0);
+    wattroff(win, COLOR_PAIR(CP_PRIMARY));
+    wattron(win, COLOR_PAIR(CP_PRIMARY) | A_BOLD);
+    mvwprintw(win, 0, 2, " %s ", title);
+    wattroff(win, COLOR_PAIR(CP_PRIMARY) | A_BOLD);
+
+    for (int i = 0; i < n && i + 1 < h - 2; i++)
+        mvwaddstr(win, 1 + i, 2, lines[i]);
+
+    wattron(win, COLOR_PAIR(CP_PRIMARY) | A_DIM);
+    mvwaddstr(win, h - 2, 2, "any key to close");
+    wattroff(win, COLOR_PAIR(CP_PRIMARY) | A_DIM);
+
+    wrefresh(win);
+    timeout(-1);
+    getch();
+    timeout(500);
+
+    delwin(win);
+    ui_draw(app);
+    doupdate();
+}
+
+int ui_choose(app_t *app, const char *title, const char *const *options, int n) {
+    if (n <= 0) return -1;
+    int sel = 0, result = -1;
+    int prev_input = app->input_active;
+    app->input_active = 1;
+    timeout(-1);
+
+    for (;;) {
+        int widest = ui_utf8_width(title) + 4;
+        if (widest < 38) widest = 38;   /* the hint line */
+        for (int i = 0; i < n; i++) {
+            int w = ui_utf8_width(options[i]) + 6;
+            if (w > widest) widest = w;
+        }
+        int w = widest + 2;
+        if (w > COLS - 4) w = COLS - 4;
+        if (w < 24) w = COLS > 24 ? 24 : COLS;
+        int h = n + 4;
+        if (h > LINES) h = LINES;
+
+        int top = (LINES - h) / 2, left = (COLS - w) / 2;
+        if (top < 0) top = 0;
+        if (left < 0) left = 0;
+
+        ui_draw(app);
+        WINDOW *win = newwin(h, w, top, left);
+        if (!win) break;
+
+        wattron(win, COLOR_PAIR(CP_PRIMARY));
+        box(win, 0, 0);
+        wattroff(win, COLOR_PAIR(CP_PRIMARY));
+        wattron(win, COLOR_PAIR(CP_PRIMARY) | A_BOLD);
+        mvwprintw(win, 0, 2, " %s ", title);
+        wattroff(win, COLOR_PAIR(CP_PRIMARY) | A_BOLD);
+
+        for (int i = 0; i < n && i + 1 < h - 2; i++) {
+            char buf[256];
+            ui_utf8_take(buf, sizeof(buf), options[i], w - 6, 1);
+            if (i == sel) { wattron(win, COLOR_PAIR(CP_TAB_ACTIVE) | A_BOLD); mvwhline(win, 1 + i, 1, ' ', w - 2); }
+            mvwaddstr(win, 1 + i, 3, buf);
+            if (i == sel) wattroff(win, COLOR_PAIR(CP_TAB_ACTIVE) | A_BOLD);
+        }
+        wattron(win, COLOR_PAIR(CP_PRIMARY) | A_DIM);
+        mvwaddstr(win, h - 2, 2, "j/k move   enter choose   esc cancel");
+        wattroff(win, COLOR_PAIR(CP_PRIMARY) | A_DIM);
+        wrefresh(win);
+
+        int ch = getch();
+        delwin(win);
+        if (ch == 'j' || ch == KEY_DOWN) { if (sel < n - 1) sel++; }
+        else if (ch == 'k' || ch == KEY_UP) { if (sel > 0) sel--; }
+        else if (ch == '\r' || ch == '\n' || ch == KEY_ENTER) { result = sel; break; }
+        else if (ch == 27 || ch == 'q') break;
+    }
+
+    timeout(500);
+    app->input_active = prev_input;
+    ui_draw(app);
+    doupdate();
+    return result;
+}
+
 void ui_help(app_t *app) {
     static const char *rows[] = {
         "Moving",
@@ -882,6 +1009,9 @@ void ui_help(app_t *app) {
         "Post",
         "  j / k                 move between comments",
         "  c                     write a comment",
+        "  r                     reply to the selected comment",
+        "  s                     show / fold what you reported",
+        "  R                     report the post or the selected comment",
         "  l                     like / unlike",
         "  o                     open media in system viewer",
         "  d                     delete the selected comment",
@@ -897,13 +1027,16 @@ void ui_help(app_t *app) {
         "  arrows, home / end    move the cursor",
         "",
         "Notifications",
-        "  enter                 open the post it refers to",
+        "  enter                 open the post (and comment) it refers to",
         "  r                     refresh",
         "",
         "Users and profiles",
         "  enter                 open a profile / a post",
         "  f                     follow or unfollow",
         "  w / W                 who they follow / who follows them",
+        "  R                     report this person",
+        "  B                     block this person",
+        "  i (Me tab)            your invite code",
         "",
         "Tabs",
         "  1 - 5                 jump to a tab",
@@ -912,6 +1045,8 @@ void ui_help(app_t *app) {
         "Settings",
         "  j / k                 move between actions",
         "  enter                 run the selected action",
+        "",
+        "Times are UTC; (GMT-06:00) is where the writer was.",
         "",
         "  ?                     this help",
         "  q                     quit",

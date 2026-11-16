@@ -83,6 +83,7 @@ typedef struct {
     int    profile_id;
     char   profile_email[256];
     char   profile_created[32];
+    char   profile_role[16];     /* user | moderator | admin | owner: the public badge */
     int    profile_is_following;
     int    profile_follows;
     int    profile_followers;
@@ -96,6 +97,9 @@ typedef struct {
     int            comment_sel;
     int            detail_scroll;
     int            detail_on_more;
+    int            detail_show_reported;  /* 's': unfold what you reported; folds again on leaving */
+    int            comment_top_count;     /* top-level comments loaded (replies come with them) */
+    int            pending_comment_id;    /* a notification's comment to select once the post opens */
 
     /* Notifications */
     notif_store_t notifs;

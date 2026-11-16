@@ -103,13 +103,16 @@ static int fetch_comments(app_t *app, int offset, int append) {
 
     announce(app, append ? "Loading more comments..." : "Loading comments...");
 
+    /* Threads: top-level comments, each followed by its replies. Paging
+     * counts top-level comments only. */
     memset(res, 0, sizeof(*res));
-    if (api_get_post_comments(app->detail.id, offset, app->cfg.page_size, res) != 0) {
+    if (api_get_post_comments_threaded(app->detail.id, offset, app->cfg.page_size, res) != 0) {
         app_set_error(app, "%s", api_get_last_error());
         return -1;
     }
 
-    if (!append) cstore_clear(&app->comments);
+    if (!append) { cstore_clear(&app->comments); app->comment_top_count = 0; }
+    for (int i = 0; i < res->count; i++) if (!res->comments[i].parent_id) app->comment_top_count++;
     if (cstore_append(&app->comments, res->comments, res->count) != 0) {
         app_set_error(app, "out of memory");
         return -1;
@@ -140,8 +143,16 @@ int net_open_post(app_t *app, const char *post_id, int feed_src) {
     if (fetch_comments(app, 0, 0) != 0) return -1;
 
     app->view = VIEW_POST;
-    if (app->comments.total_count > 0)
-        app_set_status(app, "%d comments.", app->comments.total_count);
+    app->detail_show_reported = 0;   /* what you reported starts folded every time */
+
+    /* Opened from a notification about a comment: select it. */
+    if (app->pending_comment_id) {
+        for (int i = 0; i < app->comments.count; i++)
+            if (app->comments.comments[i].id == app->pending_comment_id) { app->comment_sel = i; break; }
+        app->pending_comment_id = 0;
+    }
+    if (app->comments.count > 0)
+        app_set_status(app, "%d comments.", app->detail.comment_count);
     else
         app_set_status(app, "No comments yet.");
     return 0;
@@ -153,10 +164,8 @@ int net_load_more_comments(app_t *app) {
         return 0;
     }
     int before = app->comments.count;
-    if (fetch_comments(app, app->comments.count, 1) != 0) return -1;
-    app_set_status(app, "Loaded %d more (%d of %d).",
-                   app->comments.count - before,
-                   app->comments.count, app->comments.total_count);
+    if (fetch_comments(app, app->comment_top_count, 1) != 0) return -1;
+    app_set_status(app, "Loaded %d more.", app->comments.count - before);
     return 0;
 }
 
@@ -203,6 +212,14 @@ int net_create_post(app_t *app, const char *text, const char *media_path) {
         /* Uploads get a 120s timeout in the library, so this is the
          * longest the UI ever freezes. Say which file, so a long pause
          * is explicable. */
+        /* The website's checks first: size, video/audio availability,
+         * storage left. */
+        char why[256];
+        if (api_check_upload(media_path, why, sizeof(why)) != 0) {
+            app_set_error(app, "%s", why);
+            return -1;
+        }
+
         char msg[256];
         snprintf(msg, sizeof(msg), "Uploading %s...", base);
         announce(app, msg);
@@ -232,22 +249,29 @@ int net_create_post(app_t *app, const char *text, const char *media_path) {
     return 0;
 }
 
-int net_create_comment(app_t *app, const char *text) {
+int net_create_reply(app_t *app, int parent_id, const char *text) {
     int comment_id = 0;
 
-    announce(app, "Commenting...");
+    announce(app, parent_id ? "Replying..." : "Commenting...");
 
-    if (api_create_comment(app->detail.id, text, &comment_id) != 0) {
+    if (api_create_reply(app->detail.id, parent_id, text, &comment_id) != 0) {
         app_set_error(app, "%s", api_get_last_error());
         return -1;
     }
 
     if (fetch_comments(app, 0, 0) != 0) return -1;
     app->comment_sel = 0;
-    app->detail_scroll = 0;
     app->detail_on_more = 0;
-    app_set_status(app, "Comment added.");
+    /* Land on what was just written. */
+    for (int i = 0; i < app->comments.count; i++)
+        if (app->comments.comments[i].id == comment_id) { app->comment_sel = i; break; }
+    app->detail.comment_count++;
+    app_set_status(app, parent_id ? "Reply added." : "Comment added.");
     return 0;
+}
+
+int net_create_comment(app_t *app, const char *text) {
+    return net_create_reply(app, 0, text);
 }
 
 int net_delete_post(app_t *app, const char *post_id) {
@@ -429,6 +453,8 @@ int net_open_profile(app_t *app, int user_id) {
     }
 
     app->profile_id = user_id;
+    snprintf(app->profile_role, sizeof(app->profile_role), "user");
+    api_get_user_role(user_id, app->profile_role, sizeof(app->profile_role));
     snprintf(app->profile_email, sizeof(app->profile_email), "%s", email);
     snprintf(app->profile_created, sizeof(app->profile_created), "%s", created);
 
@@ -536,5 +562,41 @@ int net_open_user_list(app_t *app, int owner_id, list_kind_t kind) {
 
     app_set_status(app, "%d %s.", lst->count,
                    kind == LIST_FOLLOWS ? "follows" : "followers");
+    return 0;
+}
+
+/* ---------- report, block ---------- */
+
+int net_report(app_t *app, const char *type, const char *id, const char *reason) {
+    announce(app, "Sending report...");
+    if (api_report(type, id, reason, NULL) != 0) {
+        app_set_error(app, "%s", api_get_last_error());
+        return -1;
+    }
+    /* The reported item folds away, here and in the feed. */
+    if (!strcmp(type, "post")) {
+        if (!strcmp(app->detail.id, id)) app->detail.reported_by_me = 1;
+        for (int i = 0; i < app->feed.store.count; i++)
+            if (!strcmp(app->feed.store.posts[i].id, id)) app->feed.store.posts[i].reported_by_me = 1;
+    } else if (!strcmp(type, "comment")) {
+        int cid = atoi(id);
+        for (int i = 0; i < app->comments.count; i++)
+            if (app->comments.comments[i].id == cid) app->comments.comments[i].reported_by_me = 1;
+    }
+    app->detail_show_reported = 0;
+    app_set_status(app, "Thank you. The report was sent to the moderators.");
+    return 0;
+}
+
+int net_block(app_t *app, int user_id) {
+    announce(app, "Blocking...");
+    if (api_block_user(user_id) != 0) {
+        app_set_error(app, "%s", api_get_last_error());
+        return -1;
+    }
+    app->feed.fetched = 0;
+    app->users_fetched = 0;
+    app->notifs_fetched = 0;
+    app_set_status(app, "Blocked. Neither of you will see the other.");
     return 0;
 }

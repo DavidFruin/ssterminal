@@ -43,6 +43,13 @@ int  ui_confirm(app_t *app, const char *question, int danger);
 int  ui_prompt(app_t *app, const char *title, const char *label,
                int hidden, char *out, size_t outsz);
 
+/* Modal list: pick one of n options with j/k and enter. Returns the index
+ * picked, or -1 on esc/q. */
+int  ui_choose(app_t *app, const char *title, const char *const *options, int n);
+
+/* Modal information box (not an error): wrapped text, any key closes. */
+void ui_message(app_t *app, const char *title, const char *msg);
+
 /* Rows available to the body between the tab bar and the status line. */
 int  ui_body_height(void);
 

@@ -12,4 +12,8 @@ int auth_screen(app_t *app);
  * the menu rather than over the tab chrome. */
 void auth_draw(app_t *app);
 
+/* The welcome and Terms of Use checks after signing in. Returns 1 while
+ * still signed in (0: they declined the terms and were logged out). */
+int auth_after_login(app_t *app);
+
 #endif

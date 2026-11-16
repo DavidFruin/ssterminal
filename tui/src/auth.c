@@ -115,6 +115,42 @@ static int adopt_session(app_t *app, const char *jwt) {
     return 0;
 }
 
+/* After any sign-in (and at start-up with a saved session): the one-time
+ * welcome, then the Terms of Use if they changed since this account accepted
+ * them. Declining logs out. Returns 1 while still signed in. */
+int auth_after_login(app_t *app) {
+    api_me_t me;
+    if (api_get_me(&me) != 0) return 1;   /* not worth blocking the app over */
+
+    if (me.has_welcome) {
+        char msg[512];
+        if (me.welcome_inviter[0] && me.welcome_inviter_is_owner)
+            snprintf(msg, sizeof(msg), "You were invited by %s, who runs Simple Social.", me.welcome_inviter);
+        else if (me.welcome_inviter[0])
+            snprintf(msg, sizeof(msg), "%s used their only invite on you, so use yours just as wisely.", me.welcome_inviter);
+        else
+            snprintf(msg, sizeof(msg), "Glad you're here.");
+        ui_message(app, "Welcome to Simple Social!", msg);
+        api_dismiss_welcome();
+    }
+
+    if (me.terms_current > 0 && me.terms_accepted < me.terms_current) {
+        char q[512];
+        snprintf(q, sizeof(q), "The Terms of Use have changed. Read them at %s -- "
+                 "I agree to them and I'm at least 13 years old.", me.terms_url);
+        if (!ui_confirm(app, q, 0) || api_accept_terms(me.terms_current) != 0) {
+            api_logout();
+            app_clear_session_files();
+            ss_state_clear(&app->state);
+            api_set_jwt("");
+            app_set_error(app, "The Terms of Use weren't accepted, so you've been logged out.");
+            return 0;
+        }
+        app_set_status(app, "Thank you. The Terms of Use are accepted.");
+    }
+    return 1;
+}
+
 static int do_login(app_t *app) {
     char email[256], pw[256];
 
@@ -139,14 +175,33 @@ static int do_login(app_t *app) {
     return 1;
 }
 
-/* register = send a code, verify it, then set the password. */
+/* Register, code first as on the website: the invite code (and who made it),
+ * the age-and-terms question, the email and its code, then the password. */
 static int do_register(app_t *app) {
+    char code[64], inviter[256] = {0}, expires[32] = {0};
     char email[256], otp[64], pw1[256], pw2[256];
+
+    if (!ui_prompt(app, "Register", "Invite code:", 0, code, sizeof(code))) return 0;
+
+    busy(app, "Checking the invite code...");
+    if (api_check_invite_code(code, inviter, sizeof(inviter), expires, sizeof(expires)) != 0) {
+        app_set_error(app, "%s", api_get_last_error());
+        return 0;
+    }
+
+    char terms_url[256], q[600];
+    api_site_url("/terms", terms_url, sizeof(terms_url));
+    snprintf(q, sizeof(q), "Invited by %s. I agree to the Terms of Use (%s) and I'm at least 13 years old.",
+             inviter[0] ? inviter : "a member", terms_url);
+    if (!ui_confirm(app, q, 0)) {
+        app_set_error(app, "You need to agree to the Terms of Use and be at least 13 to join.");
+        return 0;
+    }
 
     if (!ui_prompt(app, "Register", "Email:", 0, email, sizeof(email))) return 0;
 
     busy(app, "Sending code...");
-    if (api_register_send_otp(email, NULL) != 0) {
+    if (api_register_send_otp(email, code) != 0) {
         app_set_error(app, "%s", api_get_last_error());
         return 0;
     }
@@ -196,6 +251,10 @@ static int do_register(app_t *app) {
     }
 
     if (adopt_session(app, jwt) != 0) return 0;
+
+    /* They agreed to the terms a moment ago: record it. */
+    api_me_t me;
+    if (api_get_me(&me) == 0 && me.terms_current > 0) api_accept_terms(me.terms_current);
 
     app_set_status(app, "Welcome, %s.", app->state.user.email);
     return 1;
@@ -292,7 +351,7 @@ int auth_screen(app_t *app) {
                     case 2: done = do_reset(app);    break;
                     case 3: return 0;
                 }
-                if (done) return 1;
+                if (done && auth_after_login(app)) return 1;
                 break;
             }
 
