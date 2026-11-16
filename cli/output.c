@@ -6,6 +6,7 @@
 int g_color_enabled = 0;
 int g_json_enabled = 0;
 int g_show_reported = 0;
+const char *g_fold_hint = " Add --show-reported to see it.";
 
 const char *C_RESET = "";
 const char *C_BOLD = "";
@@ -89,7 +90,11 @@ static const char *media_kind(const api_post_t *p) {
 // The text as a list or detail view shows it: folded when you reported it
 // (unless --show-reported), labelled when staff hid your own post.
 static const char *post_text_view(const api_post_t *p) {
-    if (p->reported_by_me && !g_show_reported) return "(You reported this post. Add --show-reported to see it.)";
+    static char folded[160];
+    if (p->reported_by_me && !g_show_reported) {
+        snprintf(folded, sizeof(folded), "(You reported this post.%s)", g_fold_hint);
+        return folded;
+    }
     return p->text;
 }
 
@@ -273,7 +278,11 @@ void print_comments(const api_comments_result_t *result) {
         if (c->deleted) { printf("%s%s[%d] Comment deleted%s\n", indent, C_DIM, c->id, C_RESET); continue; }
         if (c->frozen_by_staff) { printf("%s%s[%d] Comment frozen by staff%s\n", indent, C_DIM, c->id, C_RESET); continue; }
         const char *text = c->text;
-        if (c->reported_by_me && !g_show_reported) text = "(You reported this comment. Add --show-reported to see it.)";
+        char folded[160];
+        if (c->reported_by_me && !g_show_reported) {
+            snprintf(folded, sizeof(folded), "(You reported this comment.%s)", g_fold_hint);
+            text = folded;
+        }
         printf("%s%s[%d]%s %s%s (%s)%s: %s%s\n",
                indent, C_DIM, c->id, C_RESET,
                C_CYAN, c->user_email, when(c->created_at, c->created_tz), C_RESET,

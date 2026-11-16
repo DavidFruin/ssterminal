@@ -7,10 +7,13 @@ No default credentials, same reason as the web Playwright suite and the
 plain CLI's tests/test_cli.sh: a hardcoded fallback account that silently
 stops existing makes every test "pass" by failing to log in.
 
-    TEST_EMAIL=you@example.com TEST_PASSWORD='...' python3 tests/test_wizard.py
+    SSAPI=~/dev/ssapi python3 wizard/tests/test_wizard.py
 
-TEST_BASE_URL defaults to dev - this creates and deletes real posts, and dev
-is where that belongs. The binary is run with HOME pointed at a scratch
+starts a throwaway local server (tests/bench.sh) and logs in as its seeded
+alice@test.local. It never points at dev or prod. Against another server:
+
+    TEST_BASE_URL=http://host TEST_EMAIL=... TEST_PASSWORD='...' python3 wizard/tests/test_wizard.py
+ The binary is run with HOME pointed at a scratch
 directory for the whole run, so it never touches a real
 ~/.simple-social-cli or ~/.config/simple-social-cli.
 """
@@ -24,9 +27,22 @@ import time
 
 REPO_ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 BIN = os.path.join(REPO_ROOT, "simple-social-cli-interactive")
-BASE_URL = os.environ.get("TEST_BASE_URL", "https://dev.davidfruin.com")
+BASE_URL = os.environ.get("TEST_BASE_URL")
 EMAIL = os.environ.get("TEST_EMAIL")
 PASSWORD = os.environ.get("TEST_PASSWORD")
+BENCH = None
+if not BASE_URL:
+    if not os.environ.get("SSAPI"):
+        print("Set SSAPI to an ssapi checkout (to start a local server), or TEST_BASE_URL + TEST_EMAIL + TEST_PASSWORD.", file=sys.stderr)
+        sys.exit(1)
+    BENCH = tempfile.mkdtemp()
+    env = dict(os.environ, PORT=os.environ.get("PORT", "8192"))
+    BASE_URL = subprocess.run([os.path.join(REPO_ROOT, "tests", "bench.sh"), "start", BENCH],
+                              env=env, capture_output=True, text=True, check=True).stdout.strip().splitlines()[-1]
+    EMAIL, PASSWORD = "alice@test.local", "Passw0rd!"
+
+    import atexit
+    atexit.register(lambda: subprocess.run([os.path.join(REPO_ROOT, "tests", "bench.sh"), "stop", BENCH]))
 
 if not EMAIL or not PASSWORD:
     print("Set TEST_EMAIL and TEST_PASSWORD (a real account on "
@@ -200,12 +216,48 @@ with tempfile.TemporaryDirectory() as home:
         w.send(post_id)
         expect(w, "comment text prompt", "Text:")
         w.send("wizard test comment")
-        expect(w, "comment added", "added to")
+        out = expect(w, "comment added", "added to")
+        cm = re.search(r"Comment (\d+) added", out)
+
+        if cm:
+            print("== reply and threads ==")
+            w.send("reply")
+            expect(w, "reply post-id prompt", "Post ID:")
+            w.send(post_id)
+            expect(w, "reply comment-id prompt", "Comment ID:")
+            w.send(cm.group(1))
+            expect(w, "reply text prompt", "Text:")
+            w.send("wizard test reply")
+            expect(w, "reply added", "added under comment")
+            w.send("comments")
+            expect(w, "comments post-id prompt", "Post ID:")
+            w.send(post_id)
+            expect(w, "comments offset prompt", "Offset")
+            w.send("")
+            expect(w, "the reply is shown under its comment", "wizard test reply")
+
+        print("== times are UTC ==")
+        w.send("post")
+        expect(w, "post id prompt", "Post ID:")
+        w.send(post_id)
+        expect(w, "post date in UTC", "Date:   UTC ")
 
         w.send("delete")
         expect(w, "delete post-id prompt", "Post ID:")
         w.send(post_id)
         expect(w, "post deleted", "Deleted post")
+
+    print("== safety, invites, devices ==")
+    w.send("blocked")
+    expect(w, "blocked list", "haven't blocked anyone")
+    w.send("invite")
+    expect(w, "invite note", "choose wisely")
+    w.send("n")
+    w.send("devices")
+    expect(w, "devices list", "(this device)")
+    w.send("")
+    w.send("whoami")
+    expect(w, "whoami shows the role", "Role:")
 
     print("== logout ==")
     w.send("logout")

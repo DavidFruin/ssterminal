@@ -1,5 +1,6 @@
 #include "commands.h"
 #include "output.h"
+#include "input.h"
 #include "ss_api.h"
 #include "ss_json.h"
 #include <stdio.h>
@@ -9,6 +10,66 @@
 
 static int answer_int(const wizard_answer_t *a, int def) {
     return a->provided ? atoi(a->text) : def;
+}
+
+/* A yes/no question; only "y" or "yes" is yes. */
+static int ask_yes(const char *question) {
+    char buf[32];
+    printf("%s [y/N] ", question);
+    fflush(stdout);
+    if (input_read_line(buf, sizeof(buf)) < 0) return 0;
+    return buf[0] == 'y' || buf[0] == 'Y';
+}
+
+static int ask_line(const char *prompt, char *out, size_t size) {
+    printf("%s", prompt);
+    fflush(stdout);
+    return input_read_line(out, size) < 0 ? -1 : 0;
+}
+
+static const char *when(const char *utc, const char *tz) {
+    static char buf[4][64];
+    static int k = 0;
+    k = (k + 1) % 4;
+    api_format_time(utc, tz, buf[k], sizeof(buf[k]));
+    return buf[k];
+}
+
+#define TERMS_QUESTION "I agree to the Terms of Use (%s) and I'm at least 13 years old."
+
+static void forget_session(ss_state_t *state) {
+    api_logout();
+    ss_state_clear(state);
+    ss_state_delete_files();
+}
+
+int wizard_session_start(ss_state_t *state) {
+    api_me_t me;
+    if (api_get_me(&me) != 0) return -1;
+    ss_state_set_user(state, me.id, me.email, me.created_at);
+    api_set_user_id(me.id);
+
+    if (me.has_welcome) {
+        if (me.welcome_inviter[0] && me.welcome_inviter_is_owner)
+            printf("%sWelcome to Simple Social!%s You were invited by %s, who runs Simple Social.\n", C_BOLD, C_RESET, me.welcome_inviter);
+        else if (me.welcome_inviter[0])
+            printf("%sWelcome to Simple Social!%s %s used their only invite on you, so use yours just as wisely.\n", C_BOLD, C_RESET, me.welcome_inviter);
+        else
+            printf("%sWelcome to Simple Social!%s\n", C_BOLD, C_RESET);
+        api_dismiss_welcome();
+    }
+    if (me.terms_current > 0 && me.terms_accepted < me.terms_current) {
+        printf("%sThe Terms of Use have changed.%s Read them at %s\n", C_YELLOW, C_RESET, me.terms_url);
+        char q[512];
+        snprintf(q, sizeof(q), TERMS_QUESTION " Accept?", me.terms_url);
+        if (!ask_yes(q) || api_accept_terms(me.terms_current) != 0) {
+            print_error("The Terms of Use weren't accepted, so you've been logged out.");
+            forget_session(state);
+            return -1;
+        }
+        print_success("Thank you. The Terms of Use are accepted.");
+    }
+    return 0;
 }
 
 /* ---------------- Auth ---------------- */
@@ -32,15 +93,10 @@ static void cmd_login(ss_state_t *state, const wizard_answer_t *answers) {
     ss_state_set_refresh(state, api_get_refresh_token());
     ss_state_save_refresh(state);
 
-    char email_out[256] = {0};
-    char created[32] = {0};
-    api_get_my_info(&user_id, email_out, sizeof(email_out), created, sizeof(created));
-    ss_state_set_user(state, user_id, email_out, created);
-    ss_state_save_user(state);
-
     char msg[512];
-    snprintf(msg, sizeof(msg), "Logged in as %s (ID: %d)", email_out, user_id);
+    snprintf(msg, sizeof(msg), "Logged in as %.300s (ID: %d)", email, user_id);
     print_success(msg);
+    if (wizard_session_start(state) == 0) ss_state_save_user(state);
 }
 
 static void cmd_logout(ss_state_t *state, const wizard_answer_t *answers) {
@@ -56,30 +112,81 @@ static void cmd_logout(ss_state_t *state, const wizard_answer_t *answers) {
 static void cmd_whoami(ss_state_t *state, const wizard_answer_t *answers) {
     (void)answers;
     print_user_info(state->user.user_id, state->user.email, state->user.created_at);
+    char role[16] = "user";
+    api_get_user_role(state->user.user_id, role, sizeof(role));
+    printf("%sRole:%s   %s\n", C_BOLD, C_RESET, role_label(role));
+    api_media_limits_t lim;
+    if (api_get_media_limits(&lim) == 0 && lim.storage_limit > 0)
+        printf("%sMedia:%s  %.1f MB of %.0f MB used\n", C_BOLD, C_RESET, lim.storage_used / 1048576.0, lim.storage_limit / 1048576.0);
 }
 
+/* Code-first, as on the website: the invite code is checked (and who made
+ * it shown) before the email is even asked for. */
 static void cmd_register(ss_state_t *state, const wizard_answer_t *answers) {
-    (void)state;
-    const char *email = answers[0].text;
-    const char *otp = answers[1].text;
-    const char *password = answers[2].text;
-    const char *confirm = answers[3].text;
+    const char *code = answers[0].text;
+    char inviter[256] = {0}, expires[32] = {0};
+    if (api_check_invite_code(code, inviter, sizeof(inviter), expires, sizeof(expires)) != 0) {
+        print_error(api_get_last_error());
+        return;
+    }
+    printf("Invited by %s.\n", inviter[0] ? inviter : "a member");
 
-    if (api_register_verify_otp(email, otp) != 0) {
-        print_error(api_get_last_error());
+    char terms_url[256], q[512];
+    api_site_url("/terms", terms_url, sizeof(terms_url));
+    snprintf(q, sizeof(q), TERMS_QUESTION " Agree?", terms_url);
+    if (!ask_yes(q)) {
+        print_error("You need to agree to the Terms of Use and be at least 13 to join.");
         return;
     }
-    if (api_register_finish(email, password, confirm) != 0) {
-        print_error(api_get_last_error());
+
+    char email[256], otp[32];
+    wizard_answer_t pw[2];
+    static const field_spec_t pw_fields[2] = {{"Password", FT_PASSWORD, 0, NULL}, {"Confirm Password", FT_PASSWORD, 0, NULL}};
+    if (ask_line("Email: ", email, sizeof(email)) != 0 || !email[0]) { printf("Cancelled.\n"); return; }
+    if (api_register_send_otp(email, code) != 0) { print_error(api_get_last_error()); return; }
+    printf("We emailed a 6-digit code to %s.\n", email);
+    if (ask_line("Code from the email: ", otp, sizeof(otp)) != 0) { printf("Cancelled.\n"); return; }
+    if (api_register_verify_otp(email, otp) != 0) { print_error(api_get_last_error()); return; }
+    if (wizard_collect(pw_fields, 2, pw) != 0) { printf("Cancelled.\n"); return; }
+    if (api_register_finish(email, pw[0].text, pw[1].text) != 0) { print_error(api_get_last_error()); return; }
+
+    /* Log the new member straight in and record the terms they just agreed to. */
+    char jwt[1024] = {0};
+    int user_id = 0;
+    if (api_login(email, pw[0].text, jwt, sizeof(jwt), &user_id) != 0) {
+        print_success("Registration complete. You can now login.");
         return;
     }
-    print_success("Registration complete. You can now login.");
+    ss_state_set_jwt(state, jwt);
+    api_set_jwt(jwt);
+    api_set_user_id(user_id);
+    ss_state_save_jwt(state);
+    ss_state_set_refresh(state, api_get_refresh_token());
+    ss_state_save_refresh(state);
+    api_me_t me;
+    if (api_get_me(&me) == 0 && me.terms_current > 0) api_accept_terms(me.terms_current);
+    print_success("Registration complete. You're logged in.");
+    if (wizard_session_start(state) == 0) ss_state_save_user(state);
+}
+
+static void cmd_forgot_password(ss_state_t *state, const wizard_answer_t *answers) {
+    (void)state;
+    if (api_send_otp(answers[0].text) != 0) { print_error(api_get_last_error()); return; }
+    print_success("If that email has an account, a code is on its way. Then use 'reset-password'.");
+}
+
+static void cmd_accept_terms(ss_state_t *state, const wizard_answer_t *answers) {
+    (void)answers;
+    api_me_t me;
+    if (api_get_me(&me) != 0) { print_error(api_get_last_error()); return; }
+    if (me.terms_accepted >= me.terms_current) { print_success("You have already accepted the current Terms of Use."); return; }
+    wizard_session_start(state);
 }
 
 static void cmd_send_otp(ss_state_t *state, const wizard_answer_t *answers) {
     (void)state;
     const char *email = answers[0].text;
-    if (api_register_send_otp(email, NULL) != 0) {
+    if (api_register_send_otp(email, answers[1].provided ? answers[1].text : NULL) != 0) {
         print_error(api_get_last_error());
         return;
     }
@@ -143,13 +250,17 @@ static void cmd_post(ss_state_t *state, const wizard_answer_t *answers) {
         print_error(api_get_last_error());
         return;
     }
+    /* Something you reported stays folded unless you ask to see it. */
+    g_show_reported = post.reported_by_me && ask_yes("You reported this post. Show it anyway?");
     print_post(&post);
-
-    api_comments_result_t comments;
-    if (api_get_post_comments(post_id, 0, 25, &comments) == 0 && comments.count > 0) {
-        printf("\n%sComments (%d):%s\n", C_BOLD, comments.count, C_RESET);
-        print_comments(&comments);
+    if (!post.frozen) {
+        static api_comments_result_t comments;
+        if (api_get_post_comments_threaded(post_id, 0, 25, &comments) == 0 && comments.count > 0) {
+            printf("\n%sComments:%s\n", C_BOLD, C_RESET);
+            print_comments(&comments);
+        }
     }
+    g_show_reported = 0;
 }
 
 static void cmd_create(ss_state_t *state, const wizard_answer_t *answers) {
@@ -170,6 +281,8 @@ static void cmd_create(ss_state_t *state, const wizard_answer_t *answers) {
             print_error(msg);
             return;
         }
+        char why[256];
+        if (api_check_upload(answers[1].text, why, sizeof(why)) != 0) { print_error(why); return; }
         if (api_upload_media_with_id(answers[1].text, media_url, sizeof(media_url), &media_id) != 0) {
             print_error(api_get_last_error());
             return;
@@ -267,8 +380,8 @@ static void cmd_comments(ss_state_t *state, const wizard_answer_t *answers) {
     (void)state;
     const char *post_id = answers[0].text;
     int offset = answer_int(&answers[1], 0);
-    api_comments_result_t result;
-    if (api_get_post_comments(post_id, offset, 25, &result) != 0) {
+    static api_comments_result_t result;
+    if (api_get_post_comments_threaded(post_id, offset, 25, &result) != 0) {
         print_error(api_get_last_error());
         return;
     }
@@ -327,7 +440,9 @@ static void cmd_profile(ss_state_t *state, const wizard_answer_t *answers) {
     api_users_result_t followers, following;
     api_get_my_followers(user_id, &followers);
     api_get_my_follows(user_id, &following);
-    print_profile(user_id, email, created, followers.count, following.count);
+    char role[16] = "user";
+    api_get_user_role(user_id, role, sizeof(role));
+    print_profile(user_id, email, created, followers.count, following.count, role);
 
     if (user_id != state->user.user_id) {
         int is_following = 0;
@@ -426,6 +541,113 @@ static void cmd_delete_account(ss_state_t *state, const wizard_answer_t *answers
     print_success("Account deleted.");
 }
 
+/* ---------------- Replies, safety, invites, devices ---------------- */
+
+static void cmd_reply(ss_state_t *state, const wizard_answer_t *answers) {
+    (void)state;
+    int id = 0;
+    if (api_create_reply(answers[0].text, atoi(answers[1].text), answers[2].text, &id) != 0) {
+        print_error(api_get_last_error());
+        return;
+    }
+    char msg[128];
+    snprintf(msg, sizeof(msg), "Reply %d added under comment %.20s", id, answers[1].text);
+    print_success(msg);
+}
+
+static void cmd_report(ss_state_t *state, const wizard_answer_t *answers) {
+    (void)state;
+    const char *type = answers[0].text;
+    if (strcmp(type, "post") && strcmp(type, "comment") && strcmp(type, "user")) {
+        print_error("What to report must be post, comment or user.");
+        return;
+    }
+    printf("Why? ");
+    for (int i = 0; api_report_reasons[i]; i++) printf("%s%d) %s", i ? "  " : "", i + 1, api_report_reasons[i]);
+    printf("\n");
+    char pick[16];
+    if (ask_line("Reason number: ", pick, sizeof(pick)) != 0) { printf("Cancelled.\n"); return; }
+    int n = atoi(pick), count = 0;
+    while (api_report_reasons[count]) count++;
+    if (n < 1 || n > count) { print_error("Pick one of the numbers shown."); return; }
+    if (!ask_yes("Send this report to the moderators?")) { printf("Cancelled.\n"); return; }
+    if (api_report(type, answers[1].text, api_report_reasons[n - 1], answers[2].provided ? answers[2].text : NULL) != 0) {
+        print_error(api_get_last_error());
+        return;
+    }
+    print_success(strcmp(type, "user") ? "Thank you. The report was sent, and it's folded away for you now."
+                                        : "Thank you. The report was sent to the moderators.");
+}
+
+static void cmd_block(ss_state_t *state, const wizard_answer_t *answers) {
+    (void)state;
+    if (!ask_yes("Neither of you will see the other's posts, comments or profile. Block?")) { printf("Cancelled.\n"); return; }
+    if (api_block_user(atoi(answers[0].text)) != 0) { print_error(api_get_last_error()); return; }
+    print_success("Blocked.");
+}
+
+static void cmd_unblock(ss_state_t *state, const wizard_answer_t *answers) {
+    (void)state;
+    if (api_unblock_user(atoi(answers[0].text)) != 0) { print_error(api_get_last_error()); return; }
+    print_success("Unblocked.");
+}
+
+static void cmd_blocked(ss_state_t *state, const wizard_answer_t *answers) {
+    (void)state; (void)answers;
+    static api_users_result_t res;
+    if (api_get_blocked_users(&res) != 0) { print_error(api_get_last_error()); return; }
+    if (res.count == 0) { printf("You haven't blocked anyone.\n"); return; }
+    print_users(&res);
+}
+
+static void cmd_invite(ss_state_t *state, const wizard_answer_t *answers) {
+    (void)state; (void)answers;
+    api_invites_t inv;
+    if (api_get_my_invites(&inv) != 0) { print_error(api_get_last_error()); return; }
+    if (inv.used && !inv.unlimited) printf("You've already used your invite.\n");
+    for (int i = 0; i < inv.count; i++) {
+        printf("Live code: %s%s%s  (valid until %s)\n", C_BOLD, inv.codes[i].code, C_RESET, when(inv.codes[i].expires_at, NULL));
+        if (!inv.unlimited && ask_yes("Cancel this code?")) {
+            if (api_cancel_invite_code(inv.codes[i].code) != 0) print_error(api_get_last_error());
+            else print_success("The code was cancelled.");
+            return;
+        }
+    }
+    if (!inv.can_generate) return;
+    printf("%s\n", inv.unlimited ? "As the owner you can make as many codes as you like." : "You can only invite one person, so choose wisely!");
+    if (!ask_yes("Make an invite code now?")) return;
+    char code[32] = {0}, expires[32] = {0};
+    if (api_generate_invite_code(code, sizeof(code), expires, sizeof(expires)) != 0) { print_error(api_get_last_error()); return; }
+    printf("Your invite code: %s%s%s\nValid until %s. It works once.\n", C_BOLD, code, C_RESET, when(expires, NULL));
+}
+
+static void cmd_devices(ss_state_t *state, const wizard_answer_t *answers) {
+    (void)answers;
+    api_sessions_t ss;
+    if (api_get_sessions(&ss) != 0) { print_error(api_get_last_error()); return; }
+    for (int i = 0; i < ss.count; i++) {
+        api_session_t *d = &ss.sessions[i];
+        printf("%d) %s%s%s %s\n   signed in %s, last active %s\n", i + 1, C_BOLD, d->device_name, C_RESET,
+               d->is_current ? "(this device)" : "", when(d->created_at, d->created_tz), when(d->last_used_at, NULL));
+    }
+    char pick[16];
+    if (ask_line("Sign out a device: its number, 'others' for all but this one, or Enter for none: ", pick, sizeof(pick)) != 0 || !pick[0]) return;
+    if (!strcmp(pick, "others")) {
+        int n = 0;
+        if (api_revoke_all_other_sessions(&n) != 0) { print_error(api_get_last_error()); return; }
+        char msg[64];
+        snprintf(msg, sizeof(msg), "Signed out %d other device(s).", n);
+        print_success(msg);
+        return;
+    }
+    int k = atoi(pick);
+    if (k < 1 || k > ss.count) { print_error("Pick one of the numbers shown."); return; }
+    int was_current = 0;
+    if (api_revoke_session(ss.sessions[k - 1].id, &was_current) != 0) { print_error(api_get_last_error()); return; }
+    if (was_current) { ss_state_clear(state); ss_state_delete_files(); print_success("Signed out (that was this device)."); }
+    else print_success("That device is signed out.");
+}
+
 /* ---------------- Command table ---------------- */
 
 const command_spec_t g_commands[] = {
@@ -433,12 +655,13 @@ const command_spec_t g_commands[] = {
      {{"Email", FT_TEXT, 0, NULL}, {"Password", FT_PASSWORD, 0, NULL}}, 2, cmd_login},
     {"logout", "Logout", "AUTH", 0, {{0}}, 0, cmd_logout},
     {"whoami", "Show current user", "AUTH", 1, {{0}}, 0, cmd_whoami},
-    {"register", "Register with OTP", "AUTH", 0,
-     {{"Email", FT_TEXT, 0, NULL}, {"OTP", FT_TEXT, 0, NULL},
-      {"Password", FT_PASSWORD, 0, NULL}, {"Confirm Password", FT_PASSWORD, 0, NULL}},
-     4, cmd_register},
+    {"register", "Join with an invite code", "AUTH", 0,
+     {{"Invite code", FT_TEXT, 0, NULL}}, 1, cmd_register},
     {"send-otp", "Send registration OTP", "AUTH", 0,
-     {{"Email", FT_TEXT, 0, NULL}}, 1, cmd_send_otp},
+     {{"Email", FT_TEXT, 0, NULL}, {"Invite code", FT_TEXT, 1, "(optional)"}}, 2, cmd_send_otp},
+    {"forgot-password", "Email a password reset code", "AUTH", 0,
+     {{"Email", FT_TEXT, 0, NULL}}, 1, cmd_forgot_password},
+    {"accept-terms", "Accept the current Terms of Use", "AUTH", 1, {{0}}, 0, cmd_accept_terms},
     {"reset-password", "Reset password via OTP", "AUTH", 0,
      {{"Email", FT_TEXT, 0, NULL}, {"OTP", FT_TEXT, 0, NULL},
       {"Password", FT_PASSWORD, 0, NULL}, {"Confirm Password", FT_PASSWORD, 0, NULL}},
@@ -468,6 +691,8 @@ const command_spec_t g_commands[] = {
      {{"Post ID", FT_TEXT, 0, NULL}, {"Offset", FT_INT, 1, "(optional, default 0)"}}, 2, cmd_comments},
     {"comment", "Add comment", "COMMENTS", 1,
      {{"Post ID", FT_TEXT, 0, NULL}, {"Text", FT_TEXT, 0, NULL}}, 2, cmd_comment},
+    {"reply", "Reply to a comment", "COMMENTS", 1,
+     {{"Post ID", FT_TEXT, 0, NULL}, {"Comment ID", FT_INT, 0, NULL}, {"Text", FT_TEXT, 0, NULL}}, 3, cmd_reply},
     {"delete-comment", "Delete comment", "COMMENTS", 1,
      {{"Comment ID", FT_INT, 0, NULL}}, 1, cmd_delete_comment},
 
@@ -488,6 +713,15 @@ const command_spec_t g_commands[] = {
     {"notify-count", "Unseen notification count", "NOTIFICATIONS", 1, {{0}}, 0, cmd_notify_count},
     {"mark-seen", "Mark notifications seen", "NOTIFICATIONS", 1, {{0}}, 0, cmd_mark_seen},
 
+    {"report", "Report a post, comment or person", "SAFETY", 1,
+     {{"What (post, comment or user)", FT_TEXT, 0, NULL}, {"Its ID", FT_TEXT, 0, NULL},
+      {"Details", FT_TEXT, 1, "(optional)"}}, 3, cmd_report},
+    {"block", "Block someone", "SAFETY", 1, {{"User ID", FT_INT, 0, NULL}}, 1, cmd_block},
+    {"unblock", "Unblock someone", "SAFETY", 1, {{"User ID", FT_INT, 0, NULL}}, 1, cmd_unblock},
+    {"blocked", "People you blocked", "SAFETY", 1, {{0}}, 0, cmd_blocked},
+
+    {"invite", "Your invite code", "ACCOUNT", 1, {{0}}, 0, cmd_invite},
+    {"devices", "Signed-in devices", "ACCOUNT", 1, {{0}}, 0, cmd_devices},
     {"delete-account", "Delete your account", "ACCOUNT", 1,
      {{"Password", FT_PASSWORD, 0, NULL}}, 1, cmd_delete_account},
 };

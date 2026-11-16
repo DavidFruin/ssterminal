@@ -4,6 +4,8 @@
 #include "output.h"
 #include "repl.h"
 #include <string.h>
+#include <unistd.h>
+#include "commands.h"
 
 static ss_state_t state;
 
@@ -26,21 +28,15 @@ int main(void) {
     config_t cfg;
     config_load(&cfg);
     api_init();
+    g_color_enabled = isatty(STDOUT_FILENO);
+    g_fold_hint = " The 'post' command asks whether to show it.";
     output_init();
 
     if (ss_state_load_refresh(&state) == 0) api_set_refresh_token(state.refresh);
 
     if (ss_state_load_jwt(&state) == 0) {
         api_set_jwt(state.jwt);
-        int id = 0;
-        char email[256] = {0};
-        char created[32] = {0};
-        if (api_get_my_info(&id, email, sizeof(email), created, sizeof(created)) == 0) {
-            ss_state_set_user(&state, id, email, created);
-            api_set_user_id(id);
-        } else {
-            ss_state_clear(&state);
-        }
+        if (wizard_session_start(&state) != 0) ss_state_clear(&state);
     }
 
     repl_run(&state);

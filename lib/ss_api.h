@@ -246,6 +246,11 @@ typedef struct {
 } api_media_limits_t;
 
 int api_get_media_limits(api_media_limits_t *out);
+// The checks the website makes before an upload: size against the limit for
+// the file's kind, whether video/audio is available, and storage room. 0 =
+// go ahead (also when the limits can't be read: the server checks anyway);
+// -1 with the reason in msg, in the website's words.
+int api_check_upload(const char *path, char *msg, int msg_size);
 // Uploads a file. A busy server (503) is retried once after 3 seconds. On
 // failure the last error is the server's message; a full storage quota is
 // status 413 with code "media_quota".

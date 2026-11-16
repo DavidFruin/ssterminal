@@ -1064,6 +1064,39 @@ int api_get_media_limits(api_media_limits_t *out) {
     return rc;
 }
 
+int api_check_upload(const char *path, char *msg, int msg_size) {
+    api_media_limits_t lim;
+    if (api_get_media_limits(&lim) != 0) return 0;
+    FILE *f = fopen(path, "rb");
+    if (!f) return 0;
+    fseek(f, 0, SEEK_END);
+    long long size = ftell(f);
+    fclose(f);
+    const char *dot = strrchr(path, '.');
+    char ext[16] = {0};
+    if (dot) for (int i = 0; dot[i + 1] && i < 15; i++) ext[i] = (char)tolower((unsigned char)dot[i + 1]);
+    static const char *videos[] = {"mp4", "mov", "m4v", "webm", "mkv", "3gp", NULL};
+    static const char *audios[] = {"mp3", "wav", "m4a", "ogg", "opus", "flac", "aac", "amr", "aiff", "caf", NULL};
+    int video = 0, audio = 0;
+    for (int i = 0; videos[i]; i++) if (!strcmp(ext, videos[i])) video = 1;
+    for (int i = 0; audios[i]; i++) if (!strcmp(ext, audios[i])) audio = 1;
+    if (video && !lim.video_supported) { snprintf(msg, msg_size, "Video uploads aren't available on the server right now."); return -1; }
+    if (audio && !lim.audio_supported) { snprintf(msg, msg_size, "Audio uploads aren't available on the server right now."); return -1; }
+    long long max = video ? lim.max_video_bytes : audio ? lim.max_audio_bytes : lim.max_image_bytes;
+    if (max > 0 && size > max) {
+        snprintf(msg, msg_size, "That file is too large. The limit for %s is %lld MB.", video ? "video" : audio ? "audio" : "images", max / 1048576);
+        return -1;
+    }
+    if (lim.storage_limit > 0 && lim.storage_used + size > lim.storage_limit) {
+        if (lim.storage_limit % 1073741824LL == 0)
+            snprintf(msg, msg_size, "You have reached your media storage limit of %lld GB of media.", lim.storage_limit / 1073741824LL);
+        else
+            snprintf(msg, msg_size, "You have reached your media storage limit of %lld MB of media.", lim.storage_limit / 1048576LL);
+        return -1;
+    }
+    return 0;
+}
+
 // media.php identifies a file from its own bytes, so the Content-Type sent
 // is only a hint.
 static const char *guess_mime_type(const char *filepath) {

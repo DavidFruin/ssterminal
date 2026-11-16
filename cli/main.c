@@ -692,40 +692,9 @@ static int cmd_delete_account(int argc, char **argv) {
     return 0;
 }
 
-// The checks the website makes before an upload: the file's size against
-// the limit for its kind, whether the server can take video and audio right
-// now, and room left in the account's storage. The server checks again.
 static int check_media_before_upload(const char *path) {
-    api_media_limits_t lim;
-    if (api_get_media_limits(&lim) != 0) return 0;   // let the server decide
-    FILE *f = fopen(path, "rb");
-    if (!f) return 0;
-    fseek(f, 0, SEEK_END);
-    long long size = ftell(f);
-    fclose(f);
-    const char *dot = strrchr(path, '.');
-    char ext[16] = {0};
-    if (dot) for (int i = 0; dot[i + 1] && i < 15; i++) ext[i] = (char)tolower((unsigned char)dot[i + 1]);
-    int video = !strcmp(ext, "mp4") || !strcmp(ext, "mov") || !strcmp(ext, "m4v") || !strcmp(ext, "webm") || !strcmp(ext, "mkv") || !strcmp(ext, "3gp");
-    int audio = !strcmp(ext, "mp3") || !strcmp(ext, "wav") || !strcmp(ext, "m4a") || !strcmp(ext, "ogg") || !strcmp(ext, "opus") || !strcmp(ext, "flac") || !strcmp(ext, "aac") || !strcmp(ext, "amr") || !strcmp(ext, "aiff");
     char msg[256];
-    if (video && !lim.video_supported) { print_error("Video uploads aren't available on the server right now."); return -1; }
-    if (audio && !lim.audio_supported) { print_error("Audio uploads aren't available on the server right now."); return -1; }
-    long long max = video ? lim.max_video_bytes : audio ? lim.max_audio_bytes : lim.max_image_bytes;
-    if (max > 0 && size > max) {
-        snprintf(msg, sizeof(msg), "That file is too large. The limit for %s is %lld MB.", video ? "video" : audio ? "audio" : "images", max / 1048576);
-        print_error(msg);
-        return -1;
-    }
-    if (lim.storage_limit > 0 && lim.storage_used + size > lim.storage_limit) {
-        // The website's wording, with the limit as the server has it set.
-        if (lim.storage_limit % 1073741824LL == 0)
-            snprintf(msg, sizeof(msg), "You have reached your media storage limit of %lld GB of media.", lim.storage_limit / 1073741824LL);
-        else
-            snprintf(msg, sizeof(msg), "You have reached your media storage limit of %lld MB of media.", lim.storage_limit / 1048576LL);
-        print_error(msg);
-        return -1;
-    }
+    if (api_check_upload(path, msg, sizeof(msg)) != 0) { print_error(msg); return -1; }
     return 0;
 }
 

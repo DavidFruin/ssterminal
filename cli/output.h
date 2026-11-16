@@ -6,6 +6,7 @@
 extern int g_color_enabled;
 extern int g_json_enabled;
 extern int g_show_reported;   // --show-reported: unfold what you reported
+extern const char *g_fold_hint;   // how to unfold, after "You reported this post."
 extern const char *C_RESET;
 extern const char *C_BOLD;
 extern const char *C_CYAN;

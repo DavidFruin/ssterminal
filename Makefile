@@ -32,8 +32,9 @@ CLI_SRCS = cli/main.c cli/output.c
 CLI_OBJS = $(CLI_SRCS:.c=.o)
 CLI_BIN = simple-social-cli
 
+# cli/output.c is shared: the wizard prints everything the way the CLI does.
 WIZ_SRCS = wizard/src/main.c wizard/src/repl.c wizard/src/wizard.c wizard/src/commands.c \
-           wizard/src/output.c wizard/src/input.c
+           wizard/src/input.c cli/output.c
 WIZ_OBJS = $(WIZ_SRCS:.c=.o)
 WIZ_BIN = simple-social-cli-interactive
 
@@ -43,7 +44,7 @@ TUI_SRCS = tui/src/main.c tui/src/app.c tui/src/ui.c tui/src/net.c tui/src/store
 TUI_OBJS = $(TUI_SRCS:.c=.o)
 TUI_BIN = simple-social-tui
 
-ALL_OBJS = $(LIB_OBJS) $(CLI_OBJS) $(WIZ_OBJS) $(TUI_OBJS)
+ALL_OBJS = $(sort $(LIB_OBJS) $(CLI_OBJS) $(WIZ_OBJS) $(TUI_OBJS))
 
 all: $(CLI_BIN) $(WIZ_BIN) $(TUI_BIN)
 
